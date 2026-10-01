@@ -1,0 +1,72 @@
+# CI gonsu-appkit-go.
+#
+# HANYA runner GitHub, tidak pernah self-hosted: repository ini publik, dan PR
+# dari fork dapat menjalankan kode di runner yang dipakainya.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18.6-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d app"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://app:app@127.0.0.1:5432/app?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Format
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "Belum di-gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # go.mod dan go.sum harus sudah rapi di commit: produk menarik library
+      # ini lewat `go get`, dan go.sum yang tertinggal menggagalkan build-nya.
+      - name: go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      # Terhadap PostgreSQL nyata. Tanpa TEST_DATABASE_URL test database
+      # di-skip, jadi langkah ini memastikan tidak satu pun terlewat.
+      - name: Test
+        run: |
+          # Tanpa pipefail, test yang gagal tertutup oleh keberhasilan tee.
+          set -o pipefail
+          go test -race -count=1 -v ./... | tee "$RUNNER_TEMP/test.log"
+          if grep -q -e '^--- SKIP' -e '^    --- SKIP' "$RUNNER_TEMP/test.log"; then
+            echo "Ada test yang di-skip; CI harus menjalankan seluruhnya."
+            exit 1
+          fi

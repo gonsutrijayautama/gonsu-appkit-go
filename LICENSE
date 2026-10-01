@@ -1,0 +1,55 @@
+LISENSI GONSU APPKIT
+
+Hak Cipta (c) 2026 CV Gonsu Trijaya Utama. Seluruh hak dilindungi.
+
+Perangkat lunak ini BUKAN perangkat lunak sumber terbuka. Kode sumbernya
+dipublikasikan agar dapat diambil dengan perkakas Go yang lazim tanpa
+menyiapkan kredensial di setiap mesin, bukan agar dapat dipakai bebas oleh
+siapa pun.
+
+
+1. IZIN YANG DIBERIKAN
+
+Perangkat lunak ini adalah perkakas internal: ia dipakai tim yang membangun
+produk untuk dijual di platform GONSU One.
+
+CV Gonsu Trijaya Utama ("GONSU") memberi izin tidak eksklusif, tidak dapat
+dialihkan, dan dapat dicabut kepada pihak yang memiliki persetujuan tertulis
+dari GONSU untuk membangun produk bagi platform GONSU One, untuk:
+
+   a. mengunduh, menyalin, dan mengubah perangkat lunak ini;
+   b. menautkannya ke dalam produk tersebut; dan
+   c. menyebarkan bentuk terkompilasinya sebagai bagian dari produk tersebut.
+
+Pembeli produk tersebut menerima bentuk terkompilasinya dan TIDAK membutuhkan
+lisensi tersendiri atas perangkat lunak ini.
+
+
+2. YANG TIDAK DIIZINKAN
+
+Tanpa izin tertulis dari GONSU, dilarang:
+
+   a. memakai perangkat lunak ini untuk keperluan selain pada Butir 1;
+   b. menyebarkan kode sumbernya, baik utuh maupun sebagian;
+   c. menghapus atau mengubah pemberitahuan hak cipta dan lisensi ini;
+   d. memakainya untuk membangun layanan yang bersaing dengan GONSU One.
+
+
+3. TANPA JAMINAN
+
+PERANGKAT LUNAK INI DISEDIAKAN "SEBAGAIMANA ADANYA", TANPA JAMINAN APA PUN,
+BAIK TERSURAT MAUPUN TERSIRAT, TERMASUK NAMUN TIDAK TERBATAS PADA JAMINAN
+KELAYAKAN JUAL, KESESUAIAN UNTUK TUJUAN TERTENTU, DAN TIDAK ADANYA PELANGGARAN.
+GONSU TIDAK BERTANGGUNG JAWAB ATAS TUNTUTAN, KERUSAKAN, ATAU KEWAJIBAN LAIN
+YANG TIMBUL DARI PENGGUNAAN PERANGKAT LUNAK INI.
+
+Kewajiban GONSU atas layanan GONSU One diatur perjanjian berlangganan, bukan
+oleh berkas ini.
+
+
+4. HUKUM YANG BERLAKU
+
+Lisensi ini tunduk pada hukum Republik Indonesia.
+
+
+Pertanyaan mengenai lisensi: legal@gonsu.id
