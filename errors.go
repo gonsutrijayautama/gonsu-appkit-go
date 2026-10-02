@@ -10,6 +10,9 @@ const (
 	// KindNotFound: yang diminta tidak ada. Dipakai juga untuk data milik
 	// organization lain — keberadaannya tidak boleh bocor.
 	KindNotFound Kind = "not_found"
+	// KindConflict: data sudah diubah orang lain sejak dibaca. Pengguna perlu
+	// memuat ulang, bukan mengulang kiriman yang sama.
+	KindConflict Kind = "conflict"
 )
 
 // FieldError menunjuk satu field yang tidak sah. Field memakai nama yang sama
@@ -36,4 +39,9 @@ func Validation(message string, fields ...FieldError) *Error {
 // NotFound mengembalikan galat "tidak ditemukan".
 func NotFound(message string) *Error {
 	return &Error{Kind: KindNotFound, Message: message}
+}
+
+// Conflict mengembalikan galat "sudah diubah orang lain".
+func Conflict(message string) *Error {
+	return &Error{Kind: KindConflict, Message: message}
 }

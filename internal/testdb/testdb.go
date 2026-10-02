@@ -128,6 +128,8 @@ func Hooks() appkit.Hooks {
 					status = http.StatusBadRequest
 				case appkit.KindNotFound:
 					status = http.StatusNotFound
+				case appkit.KindConflict:
+					status = http.StatusConflict
 				}
 			} else if errors.Is(err, ErrDenied) {
 				status, body = http.StatusForbidden, map[string]any{"message": "ditolak"}
