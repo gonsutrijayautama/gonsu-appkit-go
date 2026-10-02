@@ -29,11 +29,12 @@ type Store interface {
 }
 
 // DBStore menyimpan isi berkas di tabel appkit_media_blobs. Ini penyimpanan
-// bawaan: pemasangan cloud GONSU belum menyediakan disk maupun object storage
-// untuk produk.
+// bawaan: tidak butuh layanan lain, jadi cocok untuk self-host dan pemasangan
+// tanpa object storage.
 //
 // Akibatnya isi berkas ikut membesarkan backup database, sehingga batas
-// ukuran (Options.MaxBytes) sengaja kecil.
+// ukuran (Options.MaxBytes) sengaja kecil. Untuk object storage, lihat
+// package s3store.
 type DBStore struct {
 	pool *pgxpool.Pool
 }
@@ -67,4 +68,30 @@ func (s *DBStore) Open(ctx context.Context, key string) (io.ReadCloser, error) {
 func (s *DBStore) Delete(ctx context.Context, key string) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM appkit_media_blobs WHERE key = $1`, key)
 	return err
+}
+
+// withFallback menyimpan ke primary dan membaca dari primary, lalu dari
+// fallback bila berkasnya tidak ada di primary. Dipakai Service saat
+// penyimpanannya bukan database: berkas yang isinya tersimpan di database
+// sebelum penyimpanan itu dipasang tetap terbaca.
+type withFallback struct {
+	primary, fallback Store
+}
+
+func (s withFallback) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) error {
+	return s.primary.Put(ctx, key, r, size, contentType)
+}
+
+func (s withFallback) Open(ctx context.Context, key string) (io.ReadCloser, error) {
+	rc, err := s.primary.Open(ctx, key)
+	if errors.Is(err, fs.ErrNotExist) {
+		return s.fallback.Open(ctx, key)
+	}
+	return rc, err
+}
+
+// Delete menghapus di keduanya: tidak ada yang mencatat di mana sebuah berkas
+// lama berada, dan menghapus yang tidak ada bukan galat.
+func (s withFallback) Delete(ctx context.Context, key string) error {
+	return errors.Join(s.primary.Delete(ctx, key), s.fallback.Delete(ctx, key))
 }

@@ -13,6 +13,10 @@ const (
 	// KindConflict: data sudah diubah orang lain sejak dibaca. Pengguna perlu
 	// memuat ulang, bukan mengulang kiriman yang sama.
 	KindConflict Kind = "conflict"
+	// KindQuotaExceeded: batas pemakaian organization itu sudah penuh,
+	// misalnya kuota penyimpanan paketnya. Produk memetakannya ke tawaran naik
+	// paket, bukan ke galat isian.
+	KindQuotaExceeded Kind = "quota_exceeded"
 )
 
 // FieldError menunjuk satu field yang tidak sah. Field memakai nama yang sama
@@ -44,4 +48,9 @@ func NotFound(message string) *Error {
 // Conflict mengembalikan galat "sudah diubah orang lain".
 func Conflict(message string) *Error {
 	return &Error{Kind: KindConflict, Message: message}
+}
+
+// QuotaExceeded mengembalikan galat "batas pemakaian penuh".
+func QuotaExceeded(message string) *Error {
+	return &Error{Kind: KindQuotaExceeded, Message: message}
 }

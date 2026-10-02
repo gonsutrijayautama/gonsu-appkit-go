@@ -258,7 +258,14 @@ func (s *Service) SetLogo(ctx context.Context, r io.Reader) (Profile, error) {
 	if err != nil {
 		return Profile{}, err
 	}
-	f, err := s.media.Save(ctx, org, r)
+	// Logo yang sekarang akan dihapus swapLogo, jadi tidak dihitung ke kuota.
+	var current *uuid.UUID
+	err = s.pool.QueryRow(ctx, `
+		SELECT logo_media_id FROM appkit_business_profiles WHERE organization_id = $1`, org).Scan(&current)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return Profile{}, fmt.Errorf("businessprofile: membaca logo: %w", err)
+	}
+	f, err := s.media.SaveReplacing(ctx, org, r, current)
 	if err != nil {
 		return Profile{}, err
 	}

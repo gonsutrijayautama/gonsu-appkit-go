@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -243,5 +244,307 @@ func TestPublicRoute(t *testing.T) {
 		if rec := get(path, http.Header{}); rec.Code != http.StatusNotFound {
 			t.Errorf("GET %s = %d, ingin 404", path, rec.Code)
 		}
+	}
+}
+
+func wantQuotaExceeded(t *testing.T, err error, contains string) {
+	t.Helper()
+	e, ok := errors.AsType[*appkit.Error](err)
+	if !ok || e.Kind != appkit.KindQuotaExceeded {
+		t.Fatalf("galat = %v, ingin galat kuota penuh", err)
+	}
+	if !strings.Contains(e.Message, contains) {
+		t.Errorf("pesan = %q, ingin memuat %q", e.Message, contains)
+	}
+}
+
+// sized mengembalikan "WebP" berukuran tepat n byte: kepala yang cukup untuk
+// dikenali, sisanya nol.
+func sized(n int) []byte {
+	data := make([]byte, n)
+	copy(data, "RIFF\x24\x00\x00\x00WEBPVP8 ")
+	return data
+}
+
+func TestQuota(t *testing.T) {
+	limited, unlimited, none := uuid.New(), uuid.New(), uuid.New()
+	s := newService(t, media.Options{
+		Quota: func(_ context.Context, org uuid.UUID) (int64, error) {
+			switch org {
+			case limited:
+				return 3 << 10, nil
+			case none:
+				return 0, nil
+			}
+			return media.Unlimited, nil
+		},
+	})
+	ctx := context.Background()
+
+	save := func(org uuid.UUID, n int) (media.File, error) {
+		return s.Save(ctx, org, bytes.NewReader(sized(n)))
+	}
+	wantUsage := func(org uuid.UUID, bytes int64, files int) {
+		t.Helper()
+		got, err := s.Usage(ctx, org)
+		if err != nil {
+			t.Fatalf("Usage: %v", err)
+		}
+		if got.Bytes != bytes || got.Files != files {
+			t.Errorf("Usage = %+v, ingin %d byte dalam %d berkas", got, bytes, files)
+		}
+	}
+
+	wantUsage(limited, 0, 0)
+	first, err := save(limited, 2<<10)
+	if err != nil {
+		t.Fatalf("Save di bawah kuota: %v", err)
+	}
+	wantUsage(limited, 2<<10, 1)
+
+	// 2 KB terpakai dari 3 KB: 1,5 KB lagi tidak muat, dan tidak tersimpan.
+	_, err = save(limited, 1<<10+512)
+	wantQuotaExceeded(t, err, "2 KB dari 3 KB")
+	wantUsage(limited, 2<<10, 1)
+
+	// Tepat sampai batas masih boleh.
+	if _, err := save(limited, 1<<10); err != nil {
+		t.Fatalf("Save tepat sampai batas: %v", err)
+	}
+	_, err = save(limited, 64)
+	wantQuotaExceeded(t, err, "3 KB dari 3 KB")
+
+	// Kuota dihitung per organization.
+	if _, err := save(unlimited, 8<<10); err != nil {
+		t.Errorf("Save organization tanpa batas: %v", err)
+	}
+	wantUsage(unlimited, 8<<10, 1)
+
+	// Batas nol bukan tanpa batas: hak pakai yang tidak dibawa paket dijawab
+	// nol, dan itu berarti tidak boleh menyimpan sama sekali.
+	_, err = save(none, 64)
+	wantQuotaExceeded(t, err, "tidak menyertakan penyimpanan")
+	wantUsage(none, 0, 0)
+
+	// Menghapus berkas mengembalikan ruangnya.
+	if err := s.Delete(ctx, limited, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	wantUsage(limited, 1<<10, 1)
+	if _, err := save(limited, 1<<10+512); err != nil {
+		t.Errorf("Save setelah ruang dikosongkan: %v", err)
+	}
+}
+
+// Berkas yang ditolak karena hal lain tidak menyentuh kuota: pemeriksaan
+// isian didahulukan, supaya pesannya tentang berkasnya.
+func TestQuotaAfterValidation(t *testing.T) {
+	calls := 0
+	s := newService(t, media.Options{
+		Quota: func(context.Context, uuid.UUID) (int64, error) {
+			calls++
+			return 1, nil
+		},
+	})
+	_, err := s.Save(context.Background(), uuid.New(), strings.NewReader("bukan gambar"))
+	wantValidation(t, err, "PNG, JPEG, atau WebP")
+	if calls != 0 {
+		t.Errorf("Quota dipanggil %d kali untuk berkas yang tidak sah", calls)
+	}
+}
+
+// Kuota yang gagal dibaca menggagalkan unggahan: lebih baik menolak daripada
+// menyimpan tanpa batas.
+func TestQuotaLookupFails(t *testing.T) {
+	down := errors.New("layanan hak pakai mati")
+	s := newService(t, media.Options{
+		Quota: func(context.Context, uuid.UUID) (int64, error) { return 0, down },
+	})
+	org := uuid.New()
+	_, err := s.Save(context.Background(), org, bytes.NewReader(sized(64)))
+	if !errors.Is(err, down) {
+		t.Fatalf("galat = %v, ingin galat pembacaan kuota", err)
+	}
+	if _, ok := errors.AsType[*appkit.Error](err); ok {
+		t.Error("galat pembacaan kuota tidak boleh menjadi pesan untuk pengguna")
+	}
+	if usage, _ := s.Usage(context.Background(), org); usage.Files != 0 {
+		t.Errorf("berkas tersimpan walau kuota tidak terbaca: %+v", usage)
+	}
+}
+
+// memStore adalah penyimpanan di memori, pengganti object storage di test.
+type memStore struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+}
+
+func (m *memStore) Put(_ context.Context, key string, r io.Reader, _ int64, _ string) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.objects[key] = data
+	return nil
+}
+
+func (m *memStore) Open(_ context.Context, key string) (io.ReadCloser, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.objects[key]
+	if !ok {
+		return nil, fs.ErrNotExist
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (m *memStore) Delete(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.objects, key)
+	return nil
+}
+
+func (m *memStore) len() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.objects)
+}
+
+// Produk yang memasang penyimpanan lain tidak kehilangan berkas yang isinya
+// sudah di database: berkas lama tetap terbaca dan tetap dapat dihapus,
+// sedangkan berkas baru hanya masuk ke penyimpanan baru.
+func TestStoreSwitchKeepsOldFiles(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	org := uuid.New()
+	blobs := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM appkit_media_blobs`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	read := func(s *media.Service, id uuid.UUID) []byte {
+		t.Helper()
+		_, rc, err := s.Open(ctx, id)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer rc.Close()
+		content, _ := io.ReadAll(rc)
+		return content
+	}
+
+	before, err := media.New(pool, testdb.Hooks(), media.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldData := pngBytes(t, 8, 8)
+	old, err := before.Save(ctx, org, bytes.NewReader(oldData))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mem := &memStore{objects: map[string][]byte{}}
+	after, err := media.New(pool, testdb.Hooks(), media.Options{Store: mem})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newData := pngBytes(t, 16, 16)
+	fresh, err := after.Save(ctx, org, bytes.NewReader(newData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blobs() != 1 || mem.len() != 1 {
+		t.Fatalf("isi di database = %d, di penyimpanan baru = %d; ingin 1 dan 1", blobs(), mem.len())
+	}
+
+	if !bytes.Equal(read(after, old.ID), oldData) {
+		t.Error("berkas lama tidak terbaca setelah penyimpanan diganti")
+	}
+	if !bytes.Equal(read(after, fresh.ID), newData) {
+		t.Error("berkas baru tidak terbaca")
+	}
+
+	for _, id := range []uuid.UUID{old.ID, fresh.ID} {
+		if err := after.Delete(ctx, org, id); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+	}
+	if blobs() != 0 || mem.len() != 0 {
+		t.Errorf("sisa isi: database %d, penyimpanan baru %d", blobs(), mem.len())
+	}
+}
+
+// Galat penyimpanan selain "tidak ada" tidak boleh ditutupi dengan mencari
+// ke database: berkasnya akan tampak hilang, padahal penyimpanannya yang
+// bermasalah.
+func TestStoreFailureIsNotMissing(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	mem := &memStore{objects: map[string][]byte{}}
+	s, err := media.New(pool, testdb.Hooks(), media.Options{Store: failingOpen{mem}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := s.Save(ctx, uuid.New(), bytes.NewReader(pngBytes(t, 8, 8)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = s.Open(ctx, f.ID)
+	if !errors.Is(err, errStoreDown) {
+		t.Errorf("galat = %v, ingin galat penyimpanan", err)
+	}
+}
+
+var errStoreDown = errors.New("penyimpanan tidak terjangkau")
+
+type failingOpen struct{ media.Store }
+
+func (failingOpen) Open(context.Context, string) (io.ReadCloser, error) { return nil, errStoreDown }
+
+// Berkas pengganti tidak ikut menghitung berkas yang digantikannya: kuota
+// yang penuh tidak mengunci organization dari mengganti gambarnya.
+func TestSaveReplacing(t *testing.T) {
+	s := newService(t, media.Options{
+		Quota: func(context.Context, uuid.UUID) (int64, error) { return 2 << 10, nil },
+	})
+	ctx := context.Background()
+	org, other := uuid.New(), uuid.New()
+
+	old, err := s.Save(ctx, org, bytes.NewReader(sized(2<<10)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Save(ctx, org, bytes.NewReader(sized(1<<10)))
+	wantQuotaExceeded(t, err, "2 KB dari 2 KB")
+
+	if _, err := s.SaveReplacing(ctx, org, bytes.NewReader(sized(2<<10)), &old.ID); err != nil {
+		t.Fatalf("pengganti seukuran: %v", err)
+	}
+	// Berkas lama belum dihapus pemanggil: pemakaian sementara di atas batas,
+	// dan pengganti yang lebih besar dari sisa ruang tetap ditolak.
+	_, err = s.SaveReplacing(ctx, org, bytes.NewReader(sized(1<<10)), &old.ID)
+	wantQuotaExceeded(t, err, "4 KB dari 2 KB")
+
+	// Menyebut berkas organization lain tidak menambah ruang.
+	foreign, err := s.Save(ctx, other, bytes.NewReader(sized(2<<10)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := uuid.New()
+	if _, err := s.Save(ctx, fresh, bytes.NewReader(sized(2<<10))); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.SaveReplacing(ctx, fresh, bytes.NewReader(sized(1<<10)), &foreign.ID)
+	wantQuotaExceeded(t, err, "2 KB dari 2 KB")
+
+	// Tanpa yang digantikan, SaveReplacing sama dengan Save.
+	if _, err := s.SaveReplacing(ctx, uuid.New(), bytes.NewReader(sized(1<<10)), nil); err != nil {
+		t.Errorf("SaveReplacing tanpa berkas lama: %v", err)
 	}
 }
