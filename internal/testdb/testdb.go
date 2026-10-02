@@ -76,11 +76,13 @@ func Empty(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// Session adalah sesi palsu sebuah request: organization dan izin yang
-// dipegang penggunanya.
+// Session adalah sesi palsu sebuah request: organization, pengguna, dan izin
+// yang dipegangnya.
 type Session struct {
 	Organization uuid.UUID
-	Permissions  []appkit.Permission
+	// User hanya dibaca modul yang mencatat pelaku (roles).
+	User        uuid.UUID
+	Permissions []appkit.Permission
 }
 
 type sessionKey struct{}
@@ -119,6 +121,13 @@ func Hooks() appkit.Hooks {
 				return ErrDenied
 			}
 			return nil
+		},
+		User: func(ctx context.Context) (uuid.UUID, error) {
+			s, ok := ctx.Value(sessionKey{}).(Session)
+			if !ok || s.User == uuid.Nil {
+				return uuid.Nil, ErrNoSession
+			}
+			return s.User, nil
 		},
 		WriteError: func(w http.ResponseWriter, _ *http.Request, err error) {
 			status, body := http.StatusInternalServerError, map[string]any{"message": "galat tak terduga"}

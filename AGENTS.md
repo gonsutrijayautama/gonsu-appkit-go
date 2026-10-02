@@ -1,7 +1,7 @@
 # AGENTS.md — gonsu-appkit-go
 
 Library modul standar produk GONSU: `businessprofile`, `website`, `media`
-(dengan `media/s3store`), dan `regions`.
+(dengan `media/s3store`), `regions`, dan `roles`.
 Dipasang produk lewat `go get`; project hasil `gonsu new` memakainya.
 Repository ini PUBLIK supaya `go get` berjalan tanpa kredensial, tetapi
 lisensinya proprietary (lihat `LICENSE`).
@@ -15,8 +15,8 @@ lisensinya proprietary (lihat `LICENSE`).
   tidak meng-import `gonsu-one-sdk-go`. Kontrak dengan platform (lisensi,
   login) tempatnya di SDK.
 - **Tidak meng-import kode produk.** Yang dibutuhkan dari produk diminta lewat
-  pengait di `appkit.Hooks`: organization, izin, dan penulisan galat. Galat
-  dari pengait diteruskan apa adanya.
+  pengait di `appkit.Hooks`: organization, pengguna, izin, dan penulisan
+  galat. Galat dari pengait diteruskan apa adanya.
 - **organization hanya dari `Hooks.Organization`**, tidak pernah dari body,
   query, atau environment. Setiap query menyaring `organization_id`; data
   milik organization lain dijawab "tidak ditemukan". Satu-satunya pengecualian

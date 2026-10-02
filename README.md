@@ -11,6 +11,7 @@ disalin per produk:
 | `website` | halaman depan publik: tagline, layanan, kanal, SEO — dan penyisipannya ke HTML |
 | `media` | berkas publik (logo, gambar): di database atau object storage S3/R2, dengan kuota per organization |
 | `regions` | wilayah Indonesia sampai desa beserta kode pos, untuk pemilih alamat |
+| `roles` | role per organization: role bawaan di kode, role buatan dari layar, dan izin yang berlaku bagi pemegangnya |
 
 Project hasil `gonsu new` sudah memasangnya. Halaman frontend-nya ada di
 template `gonsu-cli`, bukan di sini.
@@ -45,12 +46,17 @@ if err := appkit.Migrate(ctx, pool, logger); err != nil {
 
 ### 2. Pengait
 
-Library tidak meng-import kode produk. Produk menyerahkan tiga pengait:
+Library tidak meng-import kode produk. Produk menyerahkan pengait: tiga yang
+wajib, dan `User` yang hanya diminta modul `roles`.
 
 ```go
 hooks := appkit.Hooks{
 	// organization request ini, dari sesi yang sudah diperiksa produk.
 	Organization: tenant.OrganizationID,
+
+	// id pengguna request ini di dalam produk. Hanya dipakai `roles`, untuk
+	// mencatat pelaku perubahan.
+	User: authn.UserID,
 
 	// Pemetaan izin library ke izin produk. Yang tidak dikenal DITOLAK.
 	Authorize: func(ctx context.Context, perm appkit.Permission) error {
@@ -129,6 +135,11 @@ Relatif terhadap akar API produk (`/v1`), di balik sesi:
 | `DELETE` | `/website/images/{slot}` | `settings.website.manage` | hapus gambar |
 | `GET` | `/regions?parent=<kode>` | sesi apa pun | anak langsung; tanpa `parent`: provinsi |
 | `GET` | `/regions/search?q=&limit=` | sesi apa pun | cari kabupaten/kota, kecamatan, desa |
+| `GET` | `/roles` | `settings.roles.manage` | role, katalog izin, dan batas role buatan |
+| `POST` | `/roles` | `settings.roles.manage` | buat role buatan; menjawab `201` |
+| `PUT` | `/roles/{key}` | `settings.roles.manage` | simpan SELURUH isian role buatan |
+| `DELETE` | `/roles/{key}` | `settings.roles.manage` | hapus role buatan; menjawab `204` |
+| `GET` | `/role-events?limit=` | `settings.roles.manage` | catatan perubahan role, terbaru dulu |
 
 Tanpa sesi, di akar situs:
 
@@ -137,10 +148,10 @@ Tanpa sesi, di akar situs:
 | `GET` | `/media/{id}` | isi berkas; boleh disimpan peramban selamanya |
 | `GET` | `/site.json` | tampilan publik halaman depan |
 
-**Simpan-bersamaan.** `PUT /business-profile` dan `PUT /website` membawa
-`version` yang dibaca dari `GET`. Bila datanya sudah diubah orang lain sejak
-itu, jawabannya galat `KindConflict` dan tidak ada yang tersimpan. Mengganti
-logo atau gambar tidak menaikkan `version`.
+**Simpan-bersamaan.** `PUT /business-profile`, `PUT /website`, dan
+`PUT /roles/{key}` membawa `version` yang dibaca dari `GET`. Bila datanya
+sudah diubah orang lain sejak itu, jawabannya galat `KindConflict` dan tidak
+ada yang tersimpan. Mengganti logo atau gambar tidak menaikkan `version`.
 
 ### Profil bisnis
 
@@ -238,6 +249,158 @@ Frontend membaca elemen itu, sehingga halaman depan tidak memanggil API.
 dikembalikan apa adanya — halaman depan adalah probe platform. Alamat aplikasi
 untuk `og:image` diturunkan dari permintaan, tidak disimpan.
 
+## Role
+
+Role adalah kumpulan izin bernama. Pembagiannya:
+
+| | tempatnya | siapa yang mengubah |
+|---|---|---|
+| izin | kode produk (`roles.Options.Permissions`) | rilis produk |
+| role bawaan | kode produk (`roles.Options.Builtins`) | rilis produk |
+| role buatan | tabel `appkit_roles`, per organization | pemegang `settings.roles.manage` |
+| siapa memegang role apa | tabel pengguna milik **produk**, yang menyimpan `key` role | produk |
+
+Karena pemegang role disimpan produk, tiga hal tetap tugas produk: memeriksa
+role saat memberikannya ke pengguna, menjaga selalu ada minimal satu
+administrator aktif, dan menghitung kuota pengguna.
+
+### Memasang
+
+```go
+var access *roles.Service
+
+hooks := appkit.Hooks{
+	Organization: tenant.OrganizationID,
+	User:         authn.UserID,
+	// Satu jalur untuk izin produk dan izin modul library: yang tidak
+	// dipegang role penggunanya DITOLAK.
+	Authorize: func(ctx context.Context, perm appkit.Permission) error {
+		p, err := authn.FromContext(ctx)
+		if err != nil {
+			return err
+		}
+		ok, err := access.Can(ctx, p.OrganizationID, p.Role, perm)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return apperr.PermissionDenied("Anda tidak memiliki izin untuk tindakan ini.")
+		}
+		return nil
+	},
+	WriteError: writeError,
+}
+
+access, err = roles.New(pool, hooks, roles.Options{
+	Permissions: []roles.Definition{
+		{Name: "settings.users.manage", Group: "Pengaturan", Label: "Mengelola pengguna", Sensitive: true},
+		{Name: roles.Manage, Group: "Pengaturan", Label: "Mengelola role", Sensitive: true},
+		{Name: businessprofile.Manage, Group: "Pengaturan", Label: "Mengubah profil bisnis"},
+		{Name: "notes.read", Group: "Catatan", Label: "Melihat catatan"},
+		{Name: "notes.write", Group: "Catatan", Label: "Mengubah catatan"},
+		{Name: "portal.view", Group: "Portal", Label: "Melihat pesanan sendiri", Audience: roles.AudienceExternal},
+	},
+	Builtins: []roles.Builtin{
+		{Key: "administrator", Name: "Administrator", Administrator: true},
+		{Key: "staff", Name: "Staf", Permissions: []appkit.Permission{"notes.read", "notes.write"}},
+		{Key: "customer", Name: "Customer", Audience: roles.AudienceExternal, Permissions: []appkit.Permission{"portal.view"}},
+	},
+	// Hak pakai paket. Yang tidak dibawa paket dijawab false.
+	CustomEnabled: func(ctx context.Context, org uuid.UUID) (bool, error) {
+		return license.Feature(ctx, entitlement.RolesCustom), nil
+	},
+	// Jumlah pengguna per key role, dari tabel pengguna produk.
+	UserCounts: users.CountByRole,
+})
+```
+
+`roles.New` gagal saat start bila susunannya melanggar pagar di bawah, jadi
+salah susun tidak pernah sampai ke pengguna. Route-nya (`access.Routes()`)
+dipasang di balik sesi seperti modul lain.
+
+- `access.PermissionsOf(ctx, org, key)` mengembalikan izin yang berlaku bagi
+  pemegang role itu; `access.Can` memeriksa satu izin. Role bawaan dijawab
+  tanpa menyentuh database, role buatan dengan satu query. Produk yang
+  memeriksa banyak izin per permintaan memanggil `PermissionsOf` sekali di
+  middleware sesinya.
+- Role yang tidak ada, role milik organization lain, dan role yang sudah
+  dihapus dijawab **tanpa izin apa pun**, bukan galat.
+- Saat memberikan role ke pengguna, produk memanggil `access.Get(ctx, org,
+  key)`: tolak bila tidak ditemukan atau `active` bernilai false, dan
+  cocokkan `audience` dengan jenis penggunanya. `access.All(ctx, org)` mengisi
+  pilihan role di layar pengguna.
+
+### Pagar
+
+- **Izin ada di kode.** Yang dapat disusun dari layar hanya role. Izin yang
+  hanya ada di katalog tetapi tidak diperiksa kode mana pun tidak menjaga apa
+  pun; menjaganya tugas test produk.
+- **Role bawaan tidak dapat diubah atau dihapus.** Tepat satu bertanda
+  `Administrator`: ia memegang seluruh izin internal, termasuk yang
+  ditambahkan rilis berikutnya.
+- **Izin `Sensitive` hanya dipegang administrator bawaan.** Tidak dapat
+  dicentang ke role buatan maupun dipasang ke role bawaan lain. Tandai begitu
+  izin mengelola pengguna, mengelola role, dan langganan.
+  `settings.roles.manage` wajib ada di katalog dan wajib `Sensitive`.
+- **Satu role satu audiens.** `internal` untuk staf; `external` untuk orang
+  di luar organization, misalnya pelanggannya. Role `external` hanya berisi
+  izin `external`, dan sebaliknya; audiens tidak berubah setelah role dibuat.
+  Kode yang memeriksa izin `external` wajib membatasi datanya ke orang itu,
+  dari sesi, tidak pernah dari body.
+- **Audiens ketiga, `machine`, hanya untuk izin.** Ia untuk program yang
+  masuk dengan token, bukan orang: tidak ada role beraudiens ini dan tidak
+  ada role yang memegang izinnya. Modul token belum ada; tempatnya disiapkan
+  supaya token kelak mencentang izin dari katalog yang sama. Izin `Sensitive`
+  wajib `internal`, jadi tidak pernah dapat diberikan ke token.
+- **Izin baru tidak masuk sendiri ke role buatan.** Izin yang dihapus dari
+  katalog, yang kini `Sensitive`, atau yang berpindah audiens berhenti
+  berlaku di role buatan tanpa migrasi: yang tersimpan disaring saat dibaca.
+- **Role buatan adalah fitur paket.** Bila `CustomEnabled` menjawab false,
+  role buatan tidak dapat dibuat atau diubah (galat `KindQuotaExceeded`) dan
+  yang sudah ada **tidak memberi izin apa pun** sampai paketnya kembali;
+  menghapusnya tetap boleh. Role bawaan tidak terpengaruh.
+- **Paling banyak 30 role buatan per organization** (`Options.MaxCustom`).
+  Ini pengaman, bukan batas yang dijual; batasnya keras, juga untuk
+  pembuatan bersamaan.
+- **Role yang masih dipegang pengguna tidak dapat dihapus**, menurut
+  `UserCounts`. Pemeriksaannya tidak atomik dengan pemberian role di produk;
+  produk yang ingin database menolaknya memasang foreign key ke
+  `appkit_roles (organization_id, id)`.
+- **Setiap perubahan dicatat** di `appkit_role_events`, di transaksi yang
+  sama: pelaku, isi sebelum, dan isi sesudah. Catatan bertahan setelah
+  rolenya dihapus.
+
+### Bentuk
+
+`GET /roles`:
+
+```json
+{
+  "roles": [
+    { "key": "administrator", "name": "Administrator", "description": "", "audience": "internal", "builtin": true, "active": true, "permissions": ["settings.users.manage", "…"], "version": 0, "updated_at": null },
+    { "key": "5f0c2d1e-…", "name": "Kasir", "description": "", "audience": "internal", "builtin": false, "active": true, "permissions": ["notes.read"], "version": 2, "updated_at": "2026-10-03T03:04:05Z" }
+  ],
+  "users": { "administrator": 1, "5f0c2d1e-…": 3 },
+  "permissions": [
+    { "name": "notes.read", "group": "Catatan", "label": "Melihat catatan", "audience": "internal", "sensitive": false }
+  ],
+  "custom": { "enabled": true, "count": 1, "max": 30 }
+}
+```
+
+- `key` adalah yang disimpan produk di penggunanya: `Builtin.Key` untuk role
+  bawaan, UUID untuk role buatan. Ia tidak berubah saat role diganti namanya.
+- Body `POST /roles` dan `PUT /roles/{key}`: `name` (wajib, maksimal 60
+  karakter, unik per organization tanpa membedakan huruf besar-kecil),
+  `description` (maksimal 200), `audience`, `permissions` (minimal satu), dan
+  `version` (hanya untuk `PUT`). Field lain ditolak.
+- `audience` kosong saat membuat berarti `internal`. Saat mengubah ia boleh
+  kosong, dan bila diisi harus sama dengan audiens role itu.
+- `GET /role-events` menjawab `{"data": [...]}`; setiap catatan memuat
+  `action` (`created`, `updated`, `deleted`), `role_key`, `role_name`,
+  `actor_id`, `before`, `after`, dan `created_at`. `limit` bawaannya 50,
+  paling banyak 200.
+
 ## Media
 
 - Setiap berkas dapat dibaca **siapa pun** yang mengetahui URL-nya. Jangan
@@ -330,6 +493,13 @@ Aturan kontribusi ada di `AGENTS.md`.
 
 ## Perubahan
 
+- **v0.4.0**
+  - Baru: modul `roles` — role bawaan di kode, role buatan per organization,
+    dan `PermissionsOf`/`Can` untuk `Hooks.Authorize` produk.
+  - Baru: pengait `Hooks.User`. Hanya wajib bagi produk yang memasang `roles`;
+    `Hooks.Validate` tidak memintanya.
+  - Migrasi baru: `00005` (`appkit_roles`, `appkit_role_events`).
+  - Tidak ada yang memutus.
 - **v0.3.0**
   - Baru: `media/s3store` — isi berkas di object storage yang berbicara API
     S3 (Cloudflare R2, AWS S3). Berkas lama di database tetap terbaca.
