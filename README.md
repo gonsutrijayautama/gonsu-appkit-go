@@ -86,7 +86,9 @@ hooks := appkit.Hooks{
 				err = apperr.ConcurrentModification(e.Message)
 			case appkit.KindQuotaExceeded:
 				// Kuota paket penuh: tawarkan naik paket, bukan galat isian.
-				err = apperr.QuotaExceeded(e.Message)
+				// e.Limit menyebut batas yang mana: appkit.LimitStorage,
+				// LimitUsers, atau LimitCustomRoles.
+				err = apperr.QuotaExceeded(entitlementFor(e.Limit), e.Message)
 			case appkit.KindIdempotencyConflict:
 				err = apperr.IdempotencyKeyConflict(e.Message)
 			}
@@ -104,7 +106,13 @@ pun. Path-nya memakai sintaks `{nama}` yang dipahami `net/http` dan chi.
 ```go
 files, err := media.New(pool, hooks, media.Options{})
 // Jejak audit lebih dulu: modul yang mengubah data mencatat lewat ini.
-trail, err := audit.New(pool, hooks, audit.Options{ClientAddr: httpx.ClientAddr})
+trail, err := audit.New(pool, hooks, audit.Options{
+	ClientAddr: httpx.ClientAddr,
+	// Nama pelaku dicatat bersama id-nya. people baru terisi sesudah users.New.
+	ActorName: func(ctx context.Context, org, actor uuid.UUID) string {
+		return people.ActorName(ctx, org, actor)
+	},
+})
 profiles, err := businessprofile.New(pool, files, trail, hooks)
 sites, err := website.New(pool, profiles, files, trail, hooks, website.Options{
 	// organization halaman publik, yang dibuka tanpa sesi.
@@ -172,12 +180,12 @@ ada yang tersimpan. Mengganti logo atau gambar tidak menaikkan `version`.
 
 ```json
 {
-  "display_name": "Toko Baju Sejahtera",
-  "industry": "Ritel pakaian",
-  "email": "halo@tokobaju.example",
+  "display_name": "Usaha Contoh",
+  "industry": "Bidang usaha",
+  "email": "halo@usaha.example",
   "phone": "(022) 123-4567",
   "business_type": "company",
-  "legal_name": "PT Baju Sejahtera Makmur",
+  "legal_name": "PT Usaha Contoh",
   "tax_id": "0012345678901000",
   "address": "Jl. Pasteur No. 10",
   "region_code": "32.73.07.1001",
@@ -225,11 +233,17 @@ susunan halaman lainnya milik penyusun halaman, yang membaca identitas di sini
 sebagai sumber datanya. Modul ini tidak menyimpan teks panjang, daftar, maupun
 gambar bagian halaman.
 
+**Isi halaman dari versi lama tidak dihapus.** Teks "tentang", daftar layanan,
+dan foto "tentang" yang tersimpan sebelum v0.4.0 milik pelanggan: modul ini
+tidak lagi menyajikannya, tetapi membiarkannya utuh pada setiap simpan. Penyusun
+halaman mengimpornya lewat `sites.Legacy(ctx, org)`, dan baru sesudah itu ia
+boleh dibuang.
+
 ```json
 {
   "mode": "site",
-  "tagline": "Pakaian rapi untuk setiap hari",
-  "summary": "Toko pakaian keluarga di Bandung sejak 2010.",
+  "tagline": "Kalimat singkat tentang usaha Anda",
+  "summary": "Satu-dua kalimat yang memperkenalkan usaha Anda.",
   "contact": { "hours": "Senin–Sabtu 09.00–17.00", "map_url": "https://…", "hide_address": false },
   "channels": { "whatsapp": "6281234567890", "instagram": "https://www.instagram.com/…", "facebook": "", "tiktok": "", "youtube": "", "linkedin": "" },
   "seo": { "title": "", "description": "", "image": null },
@@ -426,7 +440,7 @@ func (s *Service) All(ctx context.Context, org uuid.UUID) ([]Role, error)
 {
   "roles": [
     { "key": "administrator", "name": "Administrator", "description": "", "audience": "internal", "builtin": true, "permissions": ["settings.users.manage", "…"], "version": 0, "updated_at": null },
-    { "key": "5f0c2d1e-…", "name": "Kasir", "description": "", "audience": "internal", "builtin": false, "permissions": ["notes.read"], "version": 2, "updated_at": "2026-10-03T03:04:05Z" }
+    { "key": "5f0c2d1e-…", "name": "Petugas Lapangan", "description": "", "audience": "internal", "builtin": false, "permissions": ["notes.read"], "version": 2, "updated_at": "2026-10-03T03:04:05Z" }
   ],
   "users": { "administrator": 1, "5f0c2d1e-…": 3 },
   "permissions": [
@@ -487,6 +501,7 @@ Tiga jalan pemberian akses, satu aturan:
 | layar Pengguna & Akses | `Invite`, `Update` (endpoint di atas) | izin `settings.users.manage` |
 | perintah operator | `Grant`, `Suspend` dengan `users.SourceOperator` | tanpa sesi |
 | pemilik organization saat masuk pertama | `Grant` dengan `users.SourceOwner` | tanpa sesi |
+| alur produk yang harus atomik, mis. mengikat orang luar ke pelanggannya | `GrantTx` di transaksi produk | tanpa sesi |
 
 Untuk login dan sesi produk, semuanya dengan `org` eksplisit:
 
@@ -518,6 +533,11 @@ func (s *Service) All(ctx context.Context, org uuid.UUID) ([]User, error)
 - **Tidak ada yang dapat menonaktifkan dirinya sendiri.**
 - **Administrator aktif terakhir tidak dapat diturunkan atau dinonaktifkan**
   lewat layar. Jalan operator tidak dibatasi: itu jalan pemulihan.
+- **Pemilik hanya diberi akses otomatis sekali.** `Grant` dengan
+  `SourceOwner` berhasil hanya bila organization belum pernah memberi akses
+  kepada siapa pun, dihitung di dalam kunci; sesudahnya `users.ErrBootstrapped`.
+  Pemilik yang dinonaktifkan tidak mendapat aksesnya kembali hanya dengan
+  masuk lagi.
 - **Role yang diberikan harus ada**, dan dibaca sesudah kunci diambil, jadi
   role yang sedang dihapus tidak dapat diberikan.
 - **Jenis orangnya tidak berubah.** Layar ini hanya memberikan role
@@ -599,7 +619,7 @@ err := trail.RecordTx(ctx, tx, audit.Entry{
 	Category: audit.CategoryActivity,
 	Action:   "document.approved",
 	Target:   audit.Target{Type: "document", ID: doc.Number},
-	Summary:  "SPK " + doc.Number + " disetujui.",
+	Summary:  "Dokumen " + doc.Number + " disetujui.",
 })
 
 // Tanpa sesi — berhasil masuk, perintah operator, sesi yang diputus sistem
@@ -632,8 +652,9 @@ err = trail.RecordFor(ctx, org, userID, audit.Entry{
       "category": "access",
       "action": "role.updated",
       "actor_id": "7b1e…",
+      "actor_name": "Ani Wijaya",
       "target": { "type": "role", "id": "5f0c2d1e-…" },
-      "summary": "Role “Kasir” diubah.",
+      "summary": "Role “Petugas Lapangan” diubah.",
       "details": { "before": { "…": "…" }, "after": { "…": "…" } },
       "client_addr": "203.0.113.7",
       "created_at": "2026-10-03T03:04:05Z"
@@ -647,7 +668,12 @@ err = trail.RecordFor(ctx, org, userID, audit.Entry{
   200. `next` dikirim balik sebagai `before` untuk halaman berikutnya; `null`
   di halaman terakhir.
 - `actor_id` adalah id pengguna di dalam produk; `null` bila bukan tindakan
-  seorang pengguna. Nama pelakunya dicari produk dari id itu.
+  seorang pengguna. `actor_name` adalah namanya SAAT tindakan dilakukan
+  (`audit.Options.ActorName`), jadi layar riwayat tidak butuh izin membaca
+  daftar pengguna; kosong bila tidak diketahui.
+- Memindahkan riwayat lama milik produk ke sini: migrasi produk boleh
+  `INSERT` langsung ke `appkit_audit_events` sekali, dengan `created_at`
+  aslinya. Database menolak `UPDATE`, jadi isilah dengan benar sejak awal.
 
 ## Idempotency
 
@@ -940,8 +966,15 @@ Aturan kontribusi ada di `AGENTS.md`.
   - **Memutus:** modul `website` kini hanya menyimpan identitas halaman
     depan. Bagian "tentang" (`about`, slot gambar `about`) dan daftar layanan
     (`services`, `icons`) dibuang dari pengaturan dan dari tampilan publik;
-    field lamanya di `PUT /website` kini ditolak. Migrasi `00011` membuang
-    kolom gambar "tentang" beserta berkasnya.
+    field lamanya di `PUT /website` kini ditolak. Isinya yang sudah tersimpan
+    TIDAK dihapus dan dapat dibaca lewat `website.Service.Legacy`.
+  - **Memutus:** `appkit.QuotaExceeded` kini menerima batasnya
+    (`appkit.QuotaExceeded(appkit.LimitUsers, pesan)`), dan `appkit.Error`
+    membawa field `Limit`. Petakan `e.Limit` di `Hooks.WriteError` supaya
+    tawaran naik paketnya tepat.
+  - Baru: `users.GrantTx`, `users.ErrBootstrapped`, `users.Service.ActorName`,
+    dan `audit.Options.ActorName` beserta `actor_name` di jawaban
+    `GET /audit-events`.
   - **Memutus:** `businessprofile.New` dan `website.New` kini menerima service
     jejak audit (`businessprofile.New(pool, files, trail, hooks)`,
     `website.New(pool, profiles, files, trail, hooks, opts)`), dan setiap
@@ -950,8 +983,8 @@ Aturan kontribusi ada di `AGENTS.md`.
   - Migrasi baru: `00005` (`appkit_audit_events`), `00006` (`appkit_roles`),
     `00007` (`appkit_users`), `00008` (`appkit_idempotency_keys`), `00009`
     (`appkit_number_schemes`, `appkit_number_counters`), `00010`
-    (`appkit_attachments`), dan `00011` (lihat di atas). Tabelnya terpasang di
-    setiap produk, dipakai atau tidak.
+    (`appkit_attachments`), `00011` (sengaja kosong), dan `00012` (kolom
+    `actor_name`). Tabelnya terpasang di setiap produk, dipakai atau tidak.
 - **v0.3.0**
   - Baru: `media/s3store` — isi berkas di object storage yang berbicara API
     S3 (Cloudflare R2, AWS S3). Berkas lama di database tetap terbaca.

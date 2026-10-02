@@ -439,3 +439,62 @@ func TestNewRequiresDependencies(t *testing.T) {
 		t.Error("New tanpa Hooks.User lolos")
 	}
 }
+
+// Nama pelaku dicatat saat tindakan dilakukan; mengganti nama sesudahnya
+// tidak mengubah catatan lama.
+func TestActorName(t *testing.T) {
+	pool := testdb.New(t)
+	names := map[uuid.UUID]string{}
+	s, err := audit.New(pool, testdb.Hooks(), audit.Options{
+		ActorName: func(_ context.Context, _, actor uuid.UUID) string { return names[actor] },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	org, ani, budi := uuid.New(), uuid.New(), uuid.New()
+	names[ani] = "  Ani Wijaya "
+	names[budi] = strings.Repeat("b", 250)
+
+	if err := s.Record(user(org, ani), entry("document.approved")); err != nil {
+		t.Fatal(err)
+	}
+	names[ani] = "Ani Baru"
+	if err := s.Record(user(org, budi), entry("document.deleted")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordFor(context.Background(), org, uuid.Nil, entry("document.expired")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Record(user(org, uuid.New()), entry("document.archived")); err != nil {
+		t.Fatal(err)
+	}
+
+	page := list(t, s, org, audit.Query{})
+	got := map[string]string{}
+	for _, e := range page.Data {
+		got[e.Action] = e.ActorName
+	}
+	if got["document.approved"] != "Ani Wijaya" {
+		t.Errorf("nama saat itu = %q, ingin %q", got["document.approved"], "Ani Wijaya")
+	}
+	if n := got["document.deleted"]; len([]rune(n)) != 200 {
+		t.Errorf("nama panjang tidak dipotong: %d karakter", len([]rune(n)))
+	}
+	// Tanpa pelaku, atau pelaku yang namanya tidak diketahui: kosong.
+	if got["document.expired"] != "" || got["document.archived"] != "" {
+		t.Errorf("nama kosong yang diharapkan = %q, %q", got["document.expired"], got["document.archived"])
+	}
+	if raw, _ := json.Marshal(page.Data[0]); !strings.Contains(string(raw), `"actor_name":`) {
+		t.Errorf("JSON tanpa actor_name: %s", raw)
+	}
+
+	// Tanpa Options.ActorName: catatan tetap tersimpan, tanpa nama.
+	plain, _ := setup(t)
+	other := uuid.New()
+	if err := plain.Record(user(other, ani), entry("document.approved")); err != nil {
+		t.Fatal(err)
+	}
+	if e := list(t, plain, other, audit.Query{}).Data[0]; e.ActorName != "" {
+		t.Errorf("nama tanpa ActorName = %q", e.ActorName)
+	}
+}

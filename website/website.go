@@ -12,6 +12,11 @@
 // sini sebagai sumber datanya. Karena itu package ini tidak menyimpan teks
 // panjang, daftar, maupun gambar bagian halaman.
 //
+// Isi halaman yang telanjur tersimpan oleh versi lama — teks "tentang",
+// daftar layanan, dan foto "tentang" — TIDAK dihapus: ia milik pelanggan.
+// Package ini tidak lagi membaca atau menyajikannya, tetapi membiarkannya
+// utuh (Legacy) sampai penyusun halaman dapat mengimpornya.
+//
 // Dua sisi:
 //
 //   - Settings, lewat API bersesi: dibaca setiap pengguna, diubah pemegang
@@ -193,10 +198,41 @@ type SEO struct {
 // documentSchema adalah nomor bentuk dokumen yang disimpan. Isian baru yang
 // hanya menambah tidak menaikkannya.
 //
-// Dokumen bernomor 1 masih dapat membawa about_text dan services, dari masa
-// package ini ikut menyimpan isi halaman. Keduanya diabaikan saat dibaca dan
-// hilang pada simpan berikutnya.
+// Dokumen bernomor 1 dapat membawa about_text dan services, dari masa
+// package ini ikut menyimpan isi halaman. Keduanya tidak dibaca, tetapi ikut
+// tersimpan utuh pada setiap simpan (lihat legacyKeys).
 const documentSchema = 2
+
+// legacyKeys adalah kunci dokumen lama yang berisi isi halaman milik
+// pelanggan. Simpan tidak pernah menghapusnya: penyusun halaman kelak
+// mengimpornya dari sini (Legacy).
+var legacyKeys = []string{"about_text", "services"}
+
+// keepLegacy menyalin kunci lama dari dokumen old ke dokumen baru doc.
+func keepLegacy(doc, old []byte) ([]byte, error) {
+	if len(old) == 0 {
+		return doc, nil
+	}
+	var was map[string]json.RawMessage
+	if err := json.Unmarshal(old, &was); err != nil {
+		return nil, fmt.Errorf("website: dokumen pengaturan rusak: %w", err)
+	}
+	var now map[string]json.RawMessage
+	if err := json.Unmarshal(doc, &now); err != nil {
+		return nil, err
+	}
+	kept := false
+	for _, key := range legacyKeys {
+		if v, ok := was[key]; ok {
+			now[key] = v
+			kept = true
+		}
+	}
+	if !kept {
+		return doc, nil
+	}
+	return json.Marshal(now)
+}
 
 // stored adalah dokumen seperti tersimpan di kolom settings: hanya teks.
 // Gambar tidak pernah masuk dokumen; ia kolom tersendiri.
@@ -325,10 +361,6 @@ func (s *Service) Update(ctx context.Context, in Input) (Settings, error) {
 		return Settings{}, appkit.Validation("Isian belum lengkap.", errs...)
 	}
 	doc := in.stored()
-	raw, err := json.Marshal(doc)
-	if err != nil {
-		return Settings{}, err
-	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -351,6 +383,13 @@ func (s *Service) Update(ctx context.Context, in Input) (Settings, error) {
 		if err := json.Unmarshal(oldRaw, &old); err != nil {
 			return Settings{}, fmt.Errorf("website: dokumen pengaturan rusak: %w", err)
 		}
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return Settings{}, err
+	}
+	if raw, err = keepLegacy(raw, oldRaw); err != nil {
+		return Settings{}, err
 	}
 
 	// Sama dengan profil bisnis: baris baru hanya untuk version 0; baris yang
@@ -393,6 +432,8 @@ func (s *Service) Update(ctx context.Context, in Input) (Settings, error) {
 
 // Slot adalah tempat gambar di pengaturan website. Sekarang hanya satu;
 // gambar bagian halaman bukan identitas, dan tempatnya di penyusun halaman.
+// Foto "tentang" dari versi lama tetap di kolom about_media_id, tetapi tidak
+// lagi dapat diganti atau dihapus lewat sini (Legacy).
 type Slot string
 
 // SlotSEO: gambar pratinjau saat tautan dibagikan.
@@ -509,4 +550,57 @@ func (s *Service) swapImage(ctx context.Context, org uuid.UUID, slot Slot, image
 		_ = s.media.Delete(context.WithoutCancel(ctx), org, *old)
 	}
 	return nil
+}
+
+// Legacy adalah isi halaman yang tersimpan oleh versi lama package ini.
+// Package ini tidak lagi menyajikannya; ia disimpan utuh supaya penyusun
+// halaman dapat mengimpornya, dan baru boleh dibuang sesudah itu.
+type Legacy struct {
+	// AboutText adalah teks "Tentang kami"; kosong bila tidak ada.
+	AboutText string `json:"about_text"`
+	// Services adalah daftar layanan apa adanya: title, description, icon.
+	Services []LegacyService `json:"services"`
+	// AboutImage adalah foto "Tentang kami"; null bila tidak ada.
+	AboutImage *media.File `json:"about_image"`
+}
+
+// LegacyService adalah satu layanan dari versi lama.
+type LegacyService struct {
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Icon        string `json:"icon"`
+}
+
+// Legacy membaca isi halaman lama org, TANPA sesi: untuk kode server produk,
+// misalnya penyusun halaman yang mengimpornya. org ditentukan kode server,
+// tidak pernah dari body atau query. Organization tanpa isi lama dijawab
+// Legacy kosong, bukan galat.
+func (s *Service) Legacy(ctx context.Context, org uuid.UUID) (Legacy, error) {
+	var (
+		raw   []byte
+		about *uuid.UUID
+		out   = Legacy{Services: []LegacyService{}}
+	)
+	err := s.pool.QueryRow(ctx, `
+		SELECT settings, about_media_id FROM appkit_websites WHERE organization_id = $1`, org).Scan(&raw, &about)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return out, nil
+	}
+	if err != nil {
+		return Legacy{}, fmt.Errorf("website: membaca isi lama: %w", err)
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return Legacy{}, fmt.Errorf("website: dokumen pengaturan rusak: %w", err)
+	}
+	if out.Services == nil {
+		out.Services = []LegacyService{}
+	}
+	if about != nil {
+		f, err := s.media.Get(ctx, org, *about)
+		if err != nil {
+			return Legacy{}, fmt.Errorf("website: membaca foto lama: %w", err)
+		}
+		out.AboutImage = &f
+	}
+	return out, nil
 }

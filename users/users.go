@@ -65,7 +65,9 @@ const (
 	SourceScreen = "screen"
 	// SourceOperator: perintah operator pemasangan.
 	SourceOperator = "operator"
-	// SourceOwner: pemilik organization saat masuk pertama.
+	// SourceOwner: pemilik organization saat masuk pertama. Grant dengan jalan
+	// ini hanya berhasil bila organization BELUM PERNAH memberi akses kepada
+	// siapa pun; sesudah itu ErrBootstrapped.
 	SourceOwner = "owner"
 )
 
@@ -234,6 +236,17 @@ func (s *Service) BySubject(ctx context.Context, org uuid.UUID, subject string) 
 // sesi pada setiap permintaan. Pemanggil memeriksa Status.
 func (s *Service) ByID(ctx context.Context, org, id uuid.UUID) (User, error) {
 	return scanUser(s.pool.QueryRow(ctx, selectUser+` WHERE organization_id = $1 AND id = $2`, org, id))
+}
+
+// ActorName mengembalikan nama tampil pengguna id di org — nama, atau email
+// bila nama kosong — dan string kosong bila tidak ditemukan. Bentuknya sesuai
+// audit.Options.ActorName.
+func (s *Service) ActorName(ctx context.Context, org, id uuid.UUID) string {
+	u, err := s.ByID(ctx, org, id)
+	if err != nil {
+		return ""
+	}
+	return u.label()
 }
 
 // ActionSignedIn adalah nama tindakan "berhasil masuk" di jejak audit,
@@ -421,7 +434,7 @@ func (s *Service) seats(ctx context.Context, db querier, org uuid.UUID) error {
 		return fmt.Errorf("users: menghitung pengguna aktif: %w", err)
 	}
 	if active >= limit {
-		return appkit.QuotaExceeded(fmt.Sprintf(
+		return appkit.QuotaExceeded(appkit.LimitUsers, fmt.Sprintf(
 			"Kuota pengguna paket sudah penuh: %d dari %d pengguna aktif. Nonaktifkan pengguna yang tidak lagi bekerja, atau naikkan paket.",
 			active, limit))
 	}
@@ -429,6 +442,12 @@ func (s *Service) seats(ctx context.Context, db querier, org uuid.UUID) error {
 }
 
 var errRole = appkit.Validation("Isian belum sesuai.", appkit.FieldError{Field: "role", Message: "Pilih role yang tersedia."})
+
+// ErrBootstrapped: Grant dengan SourceOwner ditolak karena organization itu
+// sudah pernah memberi akses kepada seseorang — aktif maupun nonaktif.
+// Pemilik yang dinonaktifkan tidak mendapat aksesnya kembali hanya dengan
+// masuk lagi; aksesnya dipulihkan administrator atau operator.
+var ErrBootstrapped = errors.New("users: organization ini sudah punya pengguna; pemilik tidak diberi akses otomatis")
 
 // Grant memberi — atau memperbarui — akses satu orang di org, TANPA sesi dan
 // tanpa memeriksa izin: untuk perintah operator, pemilik saat masuk pertama,
@@ -438,12 +457,35 @@ var errRole = appkit.Validation("Isian belum sesuai.", appkit.FieldError{Field: 
 // Orang yang sudah aktif hanya diperbarui dan tidak dihitung ulang terhadap
 // batas pengguna. Orang yang dinonaktifkan diaktifkan kembali.
 func (s *Service) Grant(ctx context.Context, org uuid.UUID, in GrantInput) (User, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return User{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	u, err := s.GrantTx(ctx, tx, org, in)
+	if err != nil {
+		return User{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return User{}, err
+	}
+	return u, nil
+}
+
+// GrantTx sama dengan Grant, di dalam transaksi tx milik pemanggil: untuk alur
+// produk yang harus atomik bersama pemberian aksesnya, misalnya mengikat orang
+// luar ke pelanggannya. Kunci pemberian akses diambil di tx dan baru lepas
+// saat tx selesai; pemanggil yang sudah memegangnya lewat LockGrants di tx
+// yang sama tidak menunggu dirinya sendiri.
+func (s *Service) GrantTx(ctx context.Context, tx pgx.Tx, org uuid.UUID, in GrantInput) (User, error) {
 	in.Subject = strings.TrimSpace(in.Subject)
 	in.Email = strings.TrimSpace(in.Email)
 	in.Name = clean(in.Name)
 	switch {
 	case org == uuid.Nil:
 		return User{}, errors.New("users: organization kosong")
+	case tx == nil:
+		return User{}, errors.New("users: transaksi wajib diisi")
 	case !in.Actor.valid():
 		return User{}, errors.New("users: pemberian akses wajib menyebut jalannya (Actor.Source)")
 	case in.Subject == "" || strings.ContainsFunc(in.Subject, unicode.IsSpace) || utf8.RuneCountInString(in.Subject) > maxSubject:
@@ -455,13 +497,20 @@ func (s *Service) Grant(ctx context.Context, org uuid.UUID, in GrantInput) (User
 		return User{}, appkit.Validation("Isian belum sesuai.", appkit.FieldError{Field: "name", Message: fmt.Sprintf("Nama maksimal %d karakter.", maxName)})
 	}
 
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return User{}, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
 	if err := s.LockGrants(ctx, tx, org); err != nil {
 		return User{}, err
+	}
+	// Pemilik hanya diberi akses otomatis selama organization belum pernah
+	// memberi akses kepada siapa pun. Dihitung di dalam kunci: dua login
+	// pertama yang bersamaan tidak sama-sama lolos.
+	if in.Actor.Source == SourceOwner {
+		var any bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM appkit_users WHERE organization_id = $1)`, org).Scan(&any); err != nil {
+			return User{}, fmt.Errorf("users: memeriksa pengguna: %w", err)
+		}
+		if any {
+			return User{}, ErrBootstrapped
+		}
 	}
 	// Role dibaca SESUDAH kunci diambil: penghapusan role mengambil kunci yang
 	// sama, jadi role yang terbaca di sini tidak dapat terhapus di sela.
@@ -516,9 +565,6 @@ func (s *Service) Grant(ctx context.Context, org uuid.UUID, in GrantInput) (User
 			map[string]any{"role_before": prev.Role, "role_after": role.Key})
 	}
 	if err != nil {
-		return User{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
 		return User{}, err
 	}
 	return u, nil

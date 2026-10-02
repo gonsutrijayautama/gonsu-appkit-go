@@ -393,7 +393,7 @@ func (s *Service) checkQuota(ctx context.Context, org uuid.UUID, size int64) err
 	case limit < 0:
 		return nil
 	case limit == 0:
-		return appkit.QuotaExceeded("Paket Anda tidak menyertakan penyimpanan berkas.")
+		return appkit.QuotaExceeded(appkit.LimitStorage, "Paket Anda tidak menyertakan penyimpanan berkas.")
 	}
 	usage, err := s.Usage(ctx, org)
 	if err != nil {
@@ -410,7 +410,7 @@ func (s *Service) checkQuota(ctx context.Context, org uuid.UUID, size int64) err
 		used += other
 	}
 	if used+size > limit {
-		return appkit.QuotaExceeded(fmt.Sprintf(
+		return appkit.QuotaExceeded(appkit.LimitStorage, fmt.Sprintf(
 			"Penyimpanan penuh: %s dari %s sudah terpakai. Hapus berkas yang tidak dipakai, atau naikkan paket.",
 			humanSize(used), humanSize(limit)))
 	}

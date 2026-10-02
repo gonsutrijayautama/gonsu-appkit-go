@@ -113,6 +113,10 @@ func wantQuotaExceeded(t *testing.T, err error, contains string) {
 	if !ok || e.Kind != appkit.KindQuotaExceeded {
 		t.Fatalf("galat = %v, ingin galat kuota penuh", err)
 	}
+	// Produk perlu tahu batas mana yang penuh untuk menawarkan paket yang tepat.
+	if e.Limit != appkit.LimitStorage {
+		t.Errorf("batas = %q, ingin %q", e.Limit, appkit.LimitStorage)
+	}
 	if !strings.Contains(e.Message, contains) {
 		t.Errorf("pesan = %q, ingin memuat %q", e.Message, contains)
 	}

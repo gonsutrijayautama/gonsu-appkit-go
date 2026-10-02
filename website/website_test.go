@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	appkit "github.com/gonsutrijayautama/gonsu-appkit-go"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/audit"
@@ -29,6 +30,7 @@ type fixture struct {
 	profiles *businessprofile.Service
 	media    *media.Service
 	trail    *audit.Service
+	pool     *pgxpool.Pool
 	// org adalah organization halaman publik (tanpa sesi).
 	org uuid.UUID
 }
@@ -36,7 +38,7 @@ type fixture struct {
 func setup(t *testing.T, ttl time.Duration) *fixture {
 	t.Helper()
 	pool := testdb.New(t)
-	f := &fixture{org: uuid.New()}
+	f := &fixture{org: uuid.New(), pool: pool}
 	var err error
 	if f.media, err = media.New(pool, testdb.Hooks(), media.Options{MaxBytes: 64 << 10}); err != nil {
 		t.Fatal(err)
@@ -761,4 +763,89 @@ func TestChangesAreRecorded(t *testing.T) {
 	if got, _ := f.sites.Get(ctx); got.Tagline != "Tagline baru" {
 		t.Errorf("perubahan tanpa pelaku tersimpan: %+v", got.Tagline)
 	}
+}
+
+// Isi halaman dari versi lama — teks "tentang", daftar layanan, foto
+// "tentang" — milik pelanggan. Ia tidak disajikan lagi, tetapi juga tidak
+// pernah dihapus: simpan berikutnya membiarkannya utuh, dan Legacy
+// membacanya untuk diimpor penyusun halaman.
+func TestLegacyContentIsKept(t *testing.T) {
+	f := setup(t, 0)
+	org := uuid.New()
+	bg := context.Background()
+
+	photo, err := f.media.Save(bg, org, bytes.NewReader(pngBytes(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keadaan yang ditinggalkan versi lama.
+	if _, err := f.pool.Exec(bg, `
+		INSERT INTO appkit_websites (organization_id, settings, about_media_id, version)
+		VALUES ($1, '{"schema":1,"mode":"site","tagline":"Lama","about_text":"Kami menjahit sendiri.","services":[{"title":"Jahit","description":"Ukuran badan","icon":"wrench"}]}', $2, 3)`,
+		org, photo.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tidak tampil di pengaturan maupun di tampilan publik.
+	s, err := f.sites.Get(admin(org))
+	if err != nil || s.Tagline != "Lama" || s.Version != 3 {
+		t.Fatalf("Get = %+v, %v", s, err)
+	}
+	f.org = org
+	site, err := f.sites.Public(bg, org)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range [][]byte{mustJSON(t, s), mustJSON(t, site)} {
+		if strings.Contains(string(raw), "menjahit") || strings.Contains(string(raw), "Jahit") {
+			t.Errorf("isi lama tersaji: %s", raw)
+		}
+	}
+
+	// Simpan dan ganti gambar pratinjau: isi lama tetap utuh.
+	in := siteInput()
+	in.Version = 3
+	if _, err := f.sites.Update(admin(org), in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.sites.SetImage(admin(org), website.SlotSEO, bytes.NewReader(pngBytes(t))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.sites.SetImage(admin(org), "about", bytes.NewReader(pngBytes(t))); err == nil {
+		t.Error("foto lama dapat diganti lewat slot about")
+	}
+
+	legacy, err := f.sites.Legacy(bg, org)
+	if err != nil {
+		t.Fatalf("Legacy: %v", err)
+	}
+	if legacy.AboutText != "Kami menjahit sendiri." || len(legacy.Services) != 1 || legacy.Services[0].Title != "Jahit" ||
+		legacy.Services[0].Icon != "wrench" || legacy.AboutImage == nil || legacy.AboutImage.ID != photo.ID {
+		t.Errorf("Legacy sesudah simpan = %+v", legacy)
+	}
+	if _, _, err := f.media.Open(bg, photo.ID); err != nil {
+		t.Errorf("foto lama terhapus: %v", err)
+	}
+
+	// Organization tanpa isi lama: kosong, bukan galat.
+	empty, err := f.sites.Legacy(bg, uuid.New())
+	if err != nil || empty.AboutText != "" || empty.Services == nil || len(empty.Services) != 0 || empty.AboutImage != nil {
+		t.Errorf("Legacy tanpa isi lama = %+v, %v", empty, err)
+	}
+	fresh := uuid.New()
+	if _, err := f.sites.Update(admin(fresh), siteInput()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.sites.Legacy(bg, fresh); err != nil || got.AboutText != "" || len(got.Services) != 0 {
+		t.Errorf("Legacy pengaturan baru = %+v, %v", got, err)
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
