@@ -28,7 +28,7 @@ func TestMigrateUsesItsOwnVersionTable(t *testing.T) {
 		}
 		return ok
 	}
-	for _, table := range []string{"appkit_schema_migrations", "appkit_media", "appkit_media_blobs", "appkit_business_profiles", "appkit_websites", "appkit_roles", "appkit_role_events"} {
+	for _, table := range []string{"appkit_schema_migrations", "appkit_media", "appkit_media_blobs", "appkit_business_profiles", "appkit_websites", "appkit_audit_events", "appkit_roles"} {
 		if !exists(table) {
 			t.Errorf("tabel %s tidak dibuat", table)
 		}

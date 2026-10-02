@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	appkit "github.com/gonsutrijayautama/gonsu-appkit-go"
+	"github.com/gonsutrijayautama/gonsu-appkit-go/audit"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/businessprofile"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/internal/testdb"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/media"
@@ -27,6 +28,7 @@ type fixture struct {
 	sites    *website.Service
 	profiles *businessprofile.Service
 	media    *media.Service
+	trail    *audit.Service
 	// org adalah organization halaman publik (tanpa sesi).
 	org uuid.UUID
 }
@@ -39,10 +41,11 @@ func setup(t *testing.T, ttl time.Duration) *fixture {
 	if f.media, err = media.New(pool, testdb.Hooks(), media.Options{MaxBytes: 64 << 10}); err != nil {
 		t.Fatal(err)
 	}
-	if f.profiles, err = businessprofile.New(pool, f.media, testdb.Hooks()); err != nil {
+	f.trail = testdb.Trail(t, pool)
+	if f.profiles, err = businessprofile.New(pool, f.media, f.trail, testdb.Hooks()); err != nil {
 		t.Fatal(err)
 	}
-	f.sites, err = website.New(pool, f.profiles, f.media, testdb.Hooks(), website.Options{
+	f.sites, err = website.New(pool, f.profiles, f.media, f.trail, testdb.Hooks(), website.Options{
 		PublicOrganization: func(*http.Request) (uuid.UUID, error) { return f.org, nil },
 		CacheTTL:           ttl,
 	})
@@ -55,6 +58,7 @@ func setup(t *testing.T, ttl time.Duration) *fixture {
 func admin(org uuid.UUID) context.Context {
 	return testdb.With(context.Background(), testdb.Session{
 		Organization: org,
+		User:         uuid.New(),
 		Permissions:  []appkit.Permission{website.Manage, businessprofile.Manage},
 	})
 }
@@ -529,10 +533,11 @@ func TestRenderHome(t *testing.T) {
 func TestRenderHomeNeverFails(t *testing.T) {
 	pool := testdb.New(t)
 	m, _ := media.New(pool, testdb.Hooks(), media.Options{})
-	profiles, _ := businessprofile.New(pool, m, testdb.Hooks())
+	trail := testdb.Trail(t, pool)
+	profiles, _ := businessprofile.New(pool, m, trail, testdb.Hooks())
 	unknown := errors.New("organization belum diketahui")
 	orgErr := error(unknown)
-	sites, err := website.New(pool, profiles, m, testdb.Hooks(), website.Options{
+	sites, err := website.New(pool, profiles, m, trail, testdb.Hooks(), website.Options{
 		PublicOrganization: func(*http.Request) (uuid.UUID, error) { return uuid.New(), orgErr },
 	})
 	if err != nil {
@@ -619,22 +624,26 @@ func TestRoutes(t *testing.T) {
 func TestNewRequiresDependencies(t *testing.T) {
 	pool := testdb.New(t)
 	m, _ := media.New(pool, testdb.Hooks(), media.Options{})
-	profiles, _ := businessprofile.New(pool, m, testdb.Hooks())
+	trail := testdb.Trail(t, pool)
+	profiles, _ := businessprofile.New(pool, m, trail, testdb.Hooks())
 	opts := website.Options{PublicOrganization: func(*http.Request) (uuid.UUID, error) { return uuid.Nil, nil }}
 
-	if _, err := website.New(nil, profiles, m, testdb.Hooks(), opts); err == nil {
+	if _, err := website.New(nil, profiles, m, trail, testdb.Hooks(), opts); err == nil {
 		t.Error("New tanpa pool lolos")
 	}
-	if _, err := website.New(pool, nil, m, testdb.Hooks(), opts); err == nil {
+	if _, err := website.New(pool, nil, m, trail, testdb.Hooks(), opts); err == nil {
 		t.Error("New tanpa profil bisnis lolos")
 	}
-	if _, err := website.New(pool, profiles, nil, testdb.Hooks(), opts); err == nil {
+	if _, err := website.New(pool, profiles, nil, trail, testdb.Hooks(), opts); err == nil {
 		t.Error("New tanpa media lolos")
 	}
-	if _, err := website.New(pool, profiles, m, appkit.Hooks{}, opts); err == nil {
+	if _, err := website.New(pool, profiles, m, nil, testdb.Hooks(), opts); err == nil {
+		t.Error("New tanpa jejak audit lolos")
+	}
+	if _, err := website.New(pool, profiles, m, trail, appkit.Hooks{}, opts); err == nil {
 		t.Error("New tanpa pengait lolos")
 	}
-	if _, err := website.New(pool, profiles, m, testdb.Hooks(), website.Options{}); err == nil {
+	if _, err := website.New(pool, profiles, m, trail, testdb.Hooks(), website.Options{}); err == nil {
 		t.Error("New tanpa PublicOrganization lolos")
 	}
 }
@@ -650,12 +659,13 @@ func TestImageQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	profiles, err := businessprofile.New(pool, m, testdb.Hooks())
+	trail := testdb.Trail(t, pool)
+	profiles, err := businessprofile.New(pool, m, trail, testdb.Hooks())
 	if err != nil {
 		t.Fatal(err)
 	}
 	org := uuid.New()
-	sites, err := website.New(pool, profiles, m, testdb.Hooks(), website.Options{
+	sites, err := website.New(pool, profiles, m, trail, testdb.Hooks(), website.Options{
 		PublicOrganization: func(*http.Request) (uuid.UUID, error) { return org, nil },
 	})
 	if err != nil {
@@ -685,5 +695,73 @@ func TestImageQuota(t *testing.T) {
 	}
 	if usage, _ := m.Usage(ctx, org); usage.Files != 1 {
 		t.Errorf("pemakaian = %+v, ingin 1 berkas", usage)
+	}
+}
+
+// Setiap perubahan pengaturan website masuk jejak audit, di transaksi yang
+// sama: yang dicatat adalah isian mana yang berubah, bukan isinya.
+func TestChangesAreRecorded(t *testing.T) {
+	f := setup(t, time.Minute)
+	org := uuid.New()
+	ctx := admin(org)
+
+	in := siteInput()
+	first, err := f.sites.Update(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.Version, in.Tagline = first.Version, "Tagline baru"
+	in.Services = in.Services[:1]
+	second, err := f.sites.Update(ctx, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simpan tanpa perubahan, simpan yang ditolak, dan menghapus gambar yang
+	// tidak ada tidak meninggalkan catatan.
+	in.Version = second.Version
+	if _, err := f.sites.Update(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	in.Version = first.Version
+	if _, err := f.sites.Update(ctx, in); err == nil {
+		t.Fatal("simpan dengan version lama lolos")
+	}
+	if _, err := f.sites.RemoveImage(ctx, website.SlotAbout); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.sites.SetImage(ctx, website.SlotSEO, bytes.NewReader(pngBytes(t))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.sites.RemoveImage(ctx, website.SlotSEO); err != nil {
+		t.Fatal(err)
+	}
+
+	events := testdb.Recorded(t, f.trail, org)
+	if len(events) != 4 {
+		t.Fatalf("tindakan tercatat = %v, ingin 4", testdb.Actions(t, f.trail, org))
+	}
+	raw, _ := json.Marshal([]any{events[0].Details, events[1].Details, events[2].Details, events[3].Details})
+	want := `[{"fields":["mode","tagline","summary","about.text","services","contact","channels"]},` +
+		`{"fields":["tagline","services"]},{"slot":"seo"},{"slot":"seo"}]`
+	if string(raw) != want {
+		t.Errorf("rincian = %s\ningin     %s", raw, want)
+	}
+	if events[0].Action != website.ActionUpdated || events[0].Category != audit.CategorySettings || events[0].ActorID == nil ||
+		events[2].Action != website.ActionImageChanged || events[3].Action != website.ActionImageRemoved {
+		t.Errorf("catatan = %+v", events)
+	}
+	// Isinya tidak pernah masuk catatan.
+	if all, _ := json.Marshal(events); strings.Contains(string(all), "Tagline baru") {
+		t.Errorf("isi pengaturan masuk jejak audit: %s", all)
+	}
+
+	// Pemegang izin tanpa identitas pengguna tidak dapat mengubah.
+	anonymous := testdb.With(context.Background(), testdb.Session{Organization: org, Permissions: []appkit.Permission{website.Manage}})
+	in.Version, in.Tagline = second.Version+1, "Tanpa pelaku"
+	if _, err := f.sites.Update(anonymous, in); !errors.Is(err, testdb.ErrNoSession) {
+		t.Errorf("Update tanpa pengguna = %v", err)
+	}
+	if got, _ := f.sites.Get(ctx); got.Tagline != "Tagline baru" {
+		t.Errorf("perubahan tanpa pelaku tersimpan: %+v", got.Tagline)
 	}
 }

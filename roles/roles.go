@@ -24,12 +24,13 @@
 //     Izin beraudiens mesin tidak dipegang role mana pun;
 //   - izin baru di katalog tidak pernah masuk sendiri ke role buatan, dan izin
 //     yang sudah tidak ada di katalog diabaikan;
-//   - role buatan adalah fitur paket (Options.CustomEnabled). Di organization
-//     yang paketnya tidak menyertakannya, role buatan tidak memberi izin apa
-//     pun; role bawaan tetap berjalan;
+//   - role buatan adalah fitur paket (Options.CustomEnabled). Yang dijual
+//     adalah kemampuan MENYUSUN: tanpa hak pakai, role buatan tidak dapat
+//     dibuat atau diubah, tetapi yang sudah ada tetap berlaku;
 //   - jumlahnya dibatasi (Options.MaxCustom), dan role yang masih dipegang
 //     pengguna tidak dapat dihapus;
-//   - setiap perubahan dicatat beserta pelakunya (Events).
+//   - setiap perubahan dicatat di jejak audit (package audit), di transaksi
+//     yang sama dengan perubahannya.
 //
 // Produk memakai PermissionsOf atau Can di Hooks.Authorize-nya; lihat README.
 package roles
@@ -49,6 +50,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	appkit "github.com/gonsutrijayautama/gonsu-appkit-go"
+	"github.com/gonsutrijayautama/gonsu-appkit-go/audit"
 )
 
 // Manage adalah izin membuat, mengubah, dan menghapus role buatan. Wajib ada
@@ -127,8 +129,14 @@ type Options struct {
 	// terbuka karena lupa dipasang; produk yang tidak menjualnya terpisah
 	// mengembalikan true.
 	//
-	// false: role buatan tidak dapat dibuat atau diubah dan tidak memberi izin
-	// apa pun. Menghapusnya tetap boleh.
+	// false: role buatan tidak dapat dibuat atau diubah; menghapusnya tetap
+	// boleh. Role buatan yang SUDAH ADA tetap berlaku: organization yang turun
+	// paket tidak boleh mendapati stafnya terkunci seketika, sama seperti
+	// kuota penyimpanan yang penuh tidak menghapus berkas yang sudah ada.
+	//
+	// Karena itu fungsi ini hanya dipanggil saat menyusun role (Create, Update,
+	// List), tidak pernah saat memeriksa izin: hak pakai yang gagal dibaca
+	// tidak dapat mengunci siapa pun.
 	CustomEnabled func(ctx context.Context, org uuid.UUID) (bool, error)
 	// MaxCustom adalah batas jumlah role buatan satu organization: pengaman,
 	// bukan batas yang dijual. Kosong: DefaultMaxCustom.
@@ -138,11 +146,23 @@ type Options struct {
 	// menolak penghapusan role yang masih dipegang pengguna, dan untuk
 	// ditampilkan.
 	UserCounts func(ctx context.Context, org uuid.UUID) (map[string]int, error)
+	// LockAssignments mengambil, di transaksi tx, kunci yang SAMA dengan yang
+	// diambil produk saat memberikan role ke pengguna — biasanya
+	// pg_advisory_xact_lock di transaksi pemberian akses. Delete memanggilnya
+	// sebelum UserCounts, sehingga menghapus role dan memberikannya tidak
+	// pernah berselang: pemberian yang lebih dulu membuat penghapusan ditolak,
+	// dan penghapusan yang lebih dulu membuat Get di sisi produk menjawab
+	// "tidak ditemukan".
+	//
+	// Boleh kosong. Tanpanya, role yang diberikan tepat saat dihapus menjadi
+	// Key tanpa role, yang tidak memegang izin apa pun.
+	LockAssignments func(ctx context.Context, tx pgx.Tx, org uuid.UUID) error
 }
 
 // Service mengelola role.
 type Service struct {
 	pool  *pgxpool.Pool
+	trail *audit.Service
 	hooks appkit.Hooks
 	opts  Options
 
@@ -154,12 +174,15 @@ type Service struct {
 	byKey    map[string]int
 }
 
-// New mengembalikan service role. Katalog dan role bawaan diperiksa di sini:
-// susunan yang melanggar pagar gagal saat start, bukan saat dipakai.
-func New(pool *pgxpool.Pool, hooks appkit.Hooks, opts Options) (*Service, error) {
+// New mengembalikan service role. Perubahan role dicatat lewat trail. Katalog
+// dan role bawaan diperiksa di sini: susunan yang melanggar pagar gagal saat
+// start, bukan saat dipakai.
+func New(pool *pgxpool.Pool, trail *audit.Service, hooks appkit.Hooks, opts Options) (*Service, error) {
 	switch {
 	case pool == nil:
 		return nil, errors.New("roles: pool wajib diisi")
+	case trail == nil:
+		return nil, errors.New("roles: service jejak audit wajib diisi")
 	case opts.CustomEnabled == nil:
 		return nil, errors.New("roles: Options.CustomEnabled wajib diisi")
 	case opts.UserCounts == nil:
@@ -168,13 +191,10 @@ func New(pool *pgxpool.Pool, hooks appkit.Hooks, opts Options) (*Service, error)
 	if err := hooks.Validate(); err != nil {
 		return nil, err
 	}
-	if hooks.User == nil {
-		return nil, errors.New("roles: Hooks.User wajib diisi")
-	}
 	if opts.MaxCustom <= 0 {
 		opts.MaxCustom = DefaultMaxCustom
 	}
-	s := &Service{pool: pool, hooks: hooks, opts: opts}
+	s := &Service{pool: pool, trail: trail, hooks: hooks, opts: opts}
 	if err := s.loadCatalog(opts.Permissions); err != nil {
 		return nil, err
 	}
@@ -228,7 +248,7 @@ func (s *Service) loadBuiltins(defs []Builtin) error {
 	for _, b := range defs {
 		r := Role{
 			Key: b.Key, Name: strings.TrimSpace(b.Name), Description: strings.TrimSpace(b.Description),
-			Audience: b.Audience, Builtin: true, Active: true,
+			Audience: b.Audience, Builtin: true,
 		}
 		if r.Audience == "" {
 			r.Audience = AudienceInternal
@@ -332,10 +352,7 @@ type Role struct {
 	Description string   `json:"description"`
 	Audience    Audience `json:"audience"`
 	Builtin     bool     `json:"builtin"`
-	// Active false: role buatan di organization yang paketnya tidak
-	// menyertakan role buatan. Izinnya tetap tampil, tetapi tidak berlaku
-	// (PermissionsOf kosong), dan role ini tidak layak diberikan ke pengguna.
-	Active      bool                `json:"active"`
+	// Permissions adalah izin yang BERLAKU bagi pemegangnya.
 	Permissions []appkit.Permission `json:"permissions"`
 	// Version dikirim balik saat menyimpan (Input.Version). 0 untuk role
 	// bawaan.
@@ -375,11 +392,11 @@ func scanRole(row pgx.Row) (stored, error) {
 	return r, nil
 }
 
-func (s *Service) role(r stored, active bool) Role {
+func (s *Service) role(r stored) Role {
 	return Role{
 		Key: r.id.String(), Name: r.name, Description: r.description, Audience: r.audience,
-		Active: active, Permissions: s.effective(r.permissions, r.audience),
-		Version: r.version, UpdatedAt: &r.updatedAt,
+		Permissions: s.effective(r.permissions, r.audience),
+		Version:     r.version, UpdatedAt: &r.updatedAt,
 	}
 }
 
@@ -425,7 +442,7 @@ func (s *Service) enabled(ctx context.Context, org uuid.UUID) (bool, error) {
 }
 
 // custom membaca role buatan org, urut nama.
-func (s *Service) custom(ctx context.Context, org uuid.UUID, active bool) ([]Role, error) {
+func (s *Service) custom(ctx context.Context, org uuid.UUID) ([]Role, error) {
 	rows, err := s.pool.Query(ctx, selectRole+` WHERE organization_id = $1 ORDER BY lower(name), id`, org)
 	if err != nil {
 		return nil, fmt.Errorf("roles: membaca role: %w", err)
@@ -437,7 +454,7 @@ func (s *Service) custom(ctx context.Context, org uuid.UUID, active bool) ([]Rol
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, s.role(r, active))
+		out = append(out, s.role(r))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("roles: membaca role: %w", err)
@@ -445,14 +462,13 @@ func (s *Service) custom(ctx context.Context, org uuid.UUID, active bool) ([]Rol
 	return out, nil
 }
 
-// Get membaca role key milik org, TANPA memeriksa izin: untuk produk, saat
-// memberikan role ke pengguna. org adalah organization sesi yang sudah
-// diperiksa produk. Role buatan milik organization lain dijawab "tidak
-// ditemukan".
+// Get membaca role key milik org, TANPA sesi dan tanpa memeriksa izin: untuk
+// produk, saat memberikan role ke pengguna — dari layar, perintah operator,
+// atau bootstrap pemilik. org ditentukan kode server, tidak pernah dari body
+// atau query. Role buatan milik organization lain dijawab "tidak ditemukan".
 //
-// Sebelum menyimpan Key ke penggunanya, produk memeriksa Active dan
-// mencocokkan Audience dengan jenis pengguna itu: role orang luar tidak untuk
-// staf, dan sebaliknya.
+// Sebelum menyimpan Key ke penggunanya, produk mencocokkan Audience dengan
+// jenis pengguna itu: role orang luar tidak untuk staf, dan sebaliknya.
 func (s *Service) Get(ctx context.Context, org uuid.UUID, key string) (Role, error) {
 	if r, ok := s.builtin(key); ok {
 		return r, nil
@@ -465,26 +481,14 @@ func (s *Service) Get(ctx context.Context, org uuid.UUID, key string) (Role, err
 	if err != nil {
 		return Role{}, err
 	}
-	active, err := s.enabled(ctx, org)
-	if err != nil {
-		return Role{}, err
-	}
-	return s.role(r, active), nil
+	return s.role(r), nil
 }
 
-// All mengembalikan seluruh role org TANPA memeriksa izin: role bawaan
-// menurut urutan Options.Builtins, lalu role buatan urut nama. Untuk produk,
-// misalnya mengisi pilihan role di layar pengguna.
+// All mengembalikan seluruh role org TANPA sesi dan tanpa memeriksa izin:
+// role bawaan menurut urutan Options.Builtins, lalu role buatan urut nama.
+// Untuk produk, misalnya mengisi pilihan dan nama role di layar pengguna.
 func (s *Service) All(ctx context.Context, org uuid.UUID) ([]Role, error) {
-	active, err := s.enabled(ctx, org)
-	if err != nil {
-		return nil, err
-	}
-	return s.all(ctx, org, active)
-}
-
-func (s *Service) all(ctx context.Context, org uuid.UUID, active bool) ([]Role, error) {
-	custom, err := s.custom(ctx, org, active)
+	custom, err := s.custom(ctx, org)
 	if err != nil {
 		return nil, err
 	}
@@ -499,10 +503,13 @@ func (s *Service) all(ctx context.Context, org uuid.UUID, active bool) ([]Role, 
 // PermissionsOf mengembalikan izin yang BERLAKU bagi pemegang role key di
 // org, untuk dipakai produk di Hooks.Authorize dan di jawaban "siapa saya".
 //
-// Jawabannya kosong, bukan galat, untuk role yang tidak ada, role milik
-// organization lain, dan role buatan di organization yang paketnya tidak
-// menyertakan role buatan: yang tidak dikenal tidak memegang izin apa pun.
-// Role bawaan dijawab tanpa menyentuh database.
+// Jawabannya kosong, bukan galat, untuk role yang tidak ada dan role milik
+// organization lain: yang tidak dikenal tidak memegang izin apa pun.
+//
+// Role bawaan dijawab dari memori, tanpa menyentuh database dan tanpa
+// kemungkinan gagal; role buatan dengan satu query. Hak pakai role buatan
+// tidak dibaca di sini. Produk yang memeriksa banyak izin per permintaan
+// memanggilnya sekali di middleware sesinya.
 func (s *Service) PermissionsOf(ctx context.Context, org uuid.UUID, key string) ([]appkit.Permission, error) {
 	r, err := s.Get(ctx, org, key)
 	if errors.Is(err, errNotFound) {
@@ -510,9 +517,6 @@ func (s *Service) PermissionsOf(ctx context.Context, org uuid.UUID, key string) 
 	}
 	if err != nil {
 		return nil, err
-	}
-	if !r.Active {
-		return []appkit.Permission{}, nil
 	}
 	return r.Permissions, nil
 }

@@ -10,12 +10,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 
 	appkit "github.com/gonsutrijayautama/gonsu-appkit-go"
+	"github.com/gonsutrijayautama/gonsu-appkit-go/audit"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/businessprofile"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/internal/testdb"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/media"
@@ -24,6 +26,7 @@ import (
 type fixture struct {
 	profiles *businessprofile.Service
 	media    *media.Service
+	trail    *audit.Service
 }
 
 func setup(t *testing.T) fixture {
@@ -33,18 +36,19 @@ func setup(t *testing.T) fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := businessprofile.New(pool, m, testdb.Hooks())
+	trail := testdb.Trail(t, pool)
+	s, err := businessprofile.New(pool, m, trail, testdb.Hooks())
 	if err != nil {
 		t.Fatal(err)
 	}
-	return fixture{profiles: s, media: m}
+	return fixture{profiles: s, media: m, trail: trail}
 }
 
 // admin dan staff: dua pengguna satu organization, hanya admin yang memegang
 // izin Manage.
 func admin(org uuid.UUID) context.Context {
 	return testdb.With(context.Background(), testdb.Session{
-		Organization: org, Permissions: []appkit.Permission{businessprofile.Manage},
+		Organization: org, User: uuid.New(), Permissions: []appkit.Permission{businessprofile.Manage},
 	})
 }
 
@@ -413,13 +417,17 @@ func TestNewRequiresDependencies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := businessprofile.New(nil, m, testdb.Hooks()); err == nil {
+	trail := testdb.Trail(t, pool)
+	if _, err := businessprofile.New(nil, m, trail, testdb.Hooks()); err == nil {
 		t.Error("New tanpa pool lolos")
 	}
-	if _, err := businessprofile.New(pool, nil, testdb.Hooks()); err == nil {
+	if _, err := businessprofile.New(pool, nil, trail, testdb.Hooks()); err == nil {
 		t.Error("New tanpa media lolos")
 	}
-	if _, err := businessprofile.New(pool, m, appkit.Hooks{}); err == nil {
+	if _, err := businessprofile.New(pool, m, nil, testdb.Hooks()); err == nil {
+		t.Error("New tanpa jejak audit lolos")
+	}
+	if _, err := businessprofile.New(pool, m, trail, appkit.Hooks{}); err == nil {
 		t.Error("New tanpa pengait lolos")
 	}
 }
@@ -437,7 +445,7 @@ func TestLogoQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	profiles, err := businessprofile.New(pool, m, testdb.Hooks())
+	profiles, err := businessprofile.New(pool, m, testdb.Trail(t, pool), testdb.Hooks())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,5 +487,76 @@ func TestLogoQuota(t *testing.T) {
 	}
 	if p, _ := profiles.Get(ctx); p.Logo == nil || p.Logo.ID != current {
 		t.Errorf("logo berubah oleh unggahan yang ditolak: %+v", p.Logo)
+	}
+}
+
+// Setiap perubahan profil masuk jejak audit, di transaksi yang sama: yang
+// dicatat adalah isian mana yang berubah, bukan nilainya.
+func TestChangesAreRecorded(t *testing.T) {
+	f := setup(t)
+	org := uuid.New()
+	user := uuid.New()
+	ctx := testdb.With(context.Background(), testdb.Session{
+		Organization: org, User: user, Permissions: []appkit.Permission{businessprofile.Manage},
+	})
+
+	p, err := f.profiles.Update(ctx, businessprofile.Input{DisplayName: "Toko Baju", TaxID: "0012345678901000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.profiles.Update(ctx, businessprofile.Input{DisplayName: "Toko Baju", TaxID: "0012345678901000", Phone: "0812-3456-7890", Version: p.Version}); err != nil {
+		t.Fatal(err)
+	}
+	// Simpan tanpa perubahan, simpan yang ditolak, dan menghapus logo yang
+	// tidak ada tidak meninggalkan catatan.
+	if _, err := f.profiles.Update(ctx, businessprofile.Input{DisplayName: "Toko Baju", TaxID: "0012345678901000", Phone: "0812-3456-7890", Version: p.Version + 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.profiles.Update(ctx, businessprofile.Input{DisplayName: "Timpa", Version: p.Version}); err == nil {
+		t.Fatal("simpan dengan version lama lolos")
+	}
+	if _, err := f.profiles.Update(ctx, businessprofile.Input{}); err == nil {
+		t.Fatal("isian kosong lolos")
+	}
+	if _, err := f.profiles.RemoveLogo(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.profiles.SetLogo(ctx, bytes.NewReader(pngBytes(t))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.profiles.RemoveLogo(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	events := testdb.Recorded(t, f.trail, org)
+	want := []string{businessprofile.ActionUpdated, businessprofile.ActionUpdated, businessprofile.ActionLogoChanged, businessprofile.ActionLogoRemoved}
+	if got := testdb.Actions(t, f.trail, org); !slices.Equal(got, want) {
+		t.Fatalf("tindakan tercatat = %v, ingin %v", got, want)
+	}
+	first, second := events[0], events[1]
+	if first.Category != audit.CategorySettings || first.ActorID == nil || *first.ActorID != user {
+		t.Errorf("catatan pertama = %+v", first)
+	}
+	raw, _ := json.Marshal([]any{first.Details, second.Details})
+	if string(raw) != `[{"fields":["display_name","tax_id"]},{"fields":["phone"]}]` {
+		t.Errorf("rincian = %s", raw)
+	}
+	// Nilainya, termasuk NPWP, tidak pernah masuk catatan.
+	if all, _ := json.Marshal(events); strings.Contains(string(all), "0012345678901000") {
+		t.Errorf("NPWP masuk jejak audit: %s", all)
+	}
+
+	// Pemegang izin tanpa identitas pengguna tidak dapat mengubah: perubahan
+	// tanpa pelaku tidak pernah tersimpan.
+	anonymous := testdb.With(context.Background(), testdb.Session{Organization: org, Permissions: []appkit.Permission{businessprofile.Manage}})
+	if _, err := f.profiles.Update(anonymous, businessprofile.Input{DisplayName: "Tanpa Pelaku", Version: p.Version + 2}); !errors.Is(err, testdb.ErrNoSession) {
+		t.Errorf("Update tanpa pengguna = %v", err)
+	}
+	if got, _ := f.profiles.Get(ctx); got.DisplayName != "Toko Baju" {
+		t.Errorf("perubahan tanpa pelaku tersimpan: %+v", got)
+	}
+	// Organization lain tidak melihat catatannya.
+	if got := testdb.Actions(t, f.trail, uuid.New()); len(got) != 0 {
+		t.Errorf("organization lain melihat catatan: %v", got)
 	}
 }

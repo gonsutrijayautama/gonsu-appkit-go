@@ -29,8 +29,7 @@ import (
 type Permission string
 
 // Hooks adalah yang diserahkan produk ke setiap modul. Organization,
-// Authorize, dan WriteError wajib; User wajib hanya untuk modul yang
-// menyebutnya.
+// Authorize, dan WriteError wajib; User wajib untuk jejak audit.
 type Hooks struct {
 	// Organization mengembalikan organization request ini, dari sesi yang
 	// sudah diperiksa produk. Modul tidak pernah membaca organization dari
@@ -50,9 +49,10 @@ type Hooks struct {
 	WriteError func(w http.ResponseWriter, r *http.Request, err error)
 
 	// User mengembalikan id pengguna request ini di dalam produk, dari sesi
-	// yang sudah diperiksa produk. Dipakai modul yang mencatat siapa pelaku
-	// sebuah perubahan (package roles); modul lain tidak membutuhkannya, jadi
-	// Validate tidak mewajibkannya.
+	// yang sudah diperiksa produk. Dipakai jejak audit (package audit) untuk
+	// mencatat pelaku sebuah perubahan, jadi wajib bagi produk yang memasang
+	// modul yang mencatat: businessprofile, website, roles. Validate tidak
+	// mewajibkannya; audit.New yang memintanya.
 	User func(ctx context.Context) (uuid.UUID, error)
 }
 

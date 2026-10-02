@@ -1,7 +1,7 @@
 # AGENTS.md — gonsu-appkit-go
 
 Library modul standar produk GONSU: `businessprofile`, `website`, `media`
-(dengan `media/s3store`), `regions`, dan `roles`.
+(dengan `media/s3store`), `regions`, `roles`, dan `audit`.
 Dipasang produk lewat `go get`; project hasil `gonsu new` memakainya.
 Repository ini PUBLIK supaya `go get` berjalan tanpa kredensial, tetapi
 lisensinya proprietary (lihat `LICENSE`).
@@ -22,6 +22,10 @@ lisensinya proprietary (lihat `LICENSE`).
   milik organization lain dijawab "tidak ditemukan". Satu-satunya pengecualian
   adalah jalur baca publik `media.Open`, dan pengecualian baru harus
   dijelaskan di komentar fungsinya.
+- **Perubahan dicatat di jejak audit**, lewat `audit.RecordTx` di transaksi
+  yang sama dengan perubahannya: perubahan tanpa catatan tidak pernah
+  tersimpan. Catatan menyebut apa yang diubah, bukan nilainya, dan tidak
+  pernah memuat isi yang rahasia. Pembacaan data tidak dicatat.
 - **Tabel berawalan `appkit_`**, dan migrasinya di `migrations/` dengan tabel
   versi `appkit_schema_migrations`. Migrasi yang sudah dirilis tidak diubah;
   perubahan skema adalah berkas migrasi baru. Tabel library tidak merujuk

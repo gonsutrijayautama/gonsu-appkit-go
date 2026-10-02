@@ -3,7 +3,6 @@ package roles
 import (
 	"net/http"
 	"path"
-	"strconv"
 
 	appkit "github.com/gonsutrijayautama/gonsu-appkit-go"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/internal/httpjson"
@@ -16,14 +15,14 @@ import (
 //	POST   /roles           buat role buatan; menjawab 201 dan rolenya
 //	PUT    /roles/{key}     simpan seluruh isian; menjawab rolenya
 //	DELETE /roles/{key}     hapus; menjawab 204
-//	GET    /role-events?limit=   catatan perubahan, terbaru dulu
+//
+// Riwayat perubahannya dibaca dari jejak audit (package audit).
 func (s *Service) Routes() []appkit.Route {
 	return []appkit.Route{
 		{Method: http.MethodGet, Path: "/roles", Handler: s.handleList},
 		{Method: http.MethodPost, Path: "/roles", Handler: s.handleCreate},
 		{Method: http.MethodPut, Path: "/roles/{key}", Handler: s.handleUpdate},
 		{Method: http.MethodDelete, Path: "/roles/{key}", Handler: s.handleDelete},
-		{Method: http.MethodGet, Path: "/role-events", Handler: s.handleEvents},
 	}
 }
 
@@ -81,11 +80,4 @@ func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Service) handleEvents(w http.ResponseWriter, r *http.Request) {
-	// Nilai limit yang tidak valid jatuh ke bawaan: ini parameter tampilan.
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	events, err := s.Events(r.Context(), limit)
-	s.respond(w, r, http.StatusOK, map[string]any{"data": events}, err)
 }

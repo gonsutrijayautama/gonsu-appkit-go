@@ -2,12 +2,10 @@ package roles
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -15,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	appkit "github.com/gonsutrijayautama/gonsu-appkit-go"
+	"github.com/gonsutrijayautama/gonsu-appkit-go/audit"
 )
 
 // Listing adalah jawaban GET /roles: yang dibutuhkan layar penyusun role.
@@ -30,10 +29,11 @@ type Listing struct {
 	Custom      Custom       `json:"custom"`
 }
 
-// Custom menyebut apakah role buatan dapat dipakai organization ini, dan
+// Custom menyebut apakah organization ini dapat menyusun role buatan, dan
 // berapa yang sudah dibuat.
 type Custom struct {
-	// Enabled false: paketnya tidak menyertakan role buatan.
+	// Enabled false: paketnya tidak menyertakan role buatan. Role buatan yang
+	// sudah ada tetap berlaku, tetapi tidak dapat diubah atau ditambah.
 	Enabled bool `json:"enabled"`
 	Count   int  `json:"count"`
 	Max     int  `json:"max"`
@@ -116,7 +116,7 @@ func names(perms []appkit.Permission) []string {
 var (
 	errChanged   = appkit.Conflict("Role ini sudah diubah orang lain. Muat ulang halaman, lalu ulangi perubahan Anda.")
 	errNameTaken = appkit.Validation("Isian belum sesuai.", appkit.FieldError{Field: "name", Message: "Nama ini sudah dipakai role lain."})
-	errDisabled  = appkit.QuotaExceeded("Paket Anda tidak menyertakan role buatan.")
+	errDisabled  = appkit.QuotaExceeded("Paket Anda tidak menyertakan role buatan. Role yang sudah ada tetap berlaku, tetapi tidak dapat diubah atau ditambah.")
 	errAudience  = appkit.Validation("Isian belum sesuai.", appkit.FieldError{Field: "audience", Message: "Audiens role tidak dapat diubah setelah role dibuat."})
 )
 
@@ -131,19 +131,12 @@ func violates(err error, code string) bool {
 	return ok && e.Code == code
 }
 
-// begin memeriksa izin Manage, lalu membaca organization dan pelaku request
-// ini.
-func (s *Service) begin(ctx context.Context) (org, actor uuid.UUID, err error) {
-	if err = s.hooks.Authorize(ctx, Manage); err != nil {
-		return uuid.Nil, uuid.Nil, err
+// begin memeriksa izin Manage, lalu membaca organization request ini.
+func (s *Service) begin(ctx context.Context) (uuid.UUID, error) {
+	if err := s.hooks.Authorize(ctx, Manage); err != nil {
+		return uuid.Nil, err
 	}
-	if org, err = s.hooks.Organization(ctx); err != nil {
-		return uuid.Nil, uuid.Nil, err
-	}
-	if actor, err = s.hooks.User(ctx); err != nil {
-		return uuid.Nil, uuid.Nil, err
-	}
-	return org, actor, nil
+	return s.hooks.Organization(ctx)
 }
 
 // requireCustom menolak bila paket org tidak menyertakan role buatan.
@@ -160,18 +153,15 @@ func (s *Service) requireCustom(ctx context.Context, org uuid.UUID) error {
 
 // List mengembalikan role organization request ini beserta katalog izinnya.
 func (s *Service) List(ctx context.Context) (Listing, error) {
-	if err := s.hooks.Authorize(ctx, Manage); err != nil {
-		return Listing{}, err
-	}
-	org, err := s.hooks.Organization(ctx)
+	org, err := s.begin(ctx)
 	if err != nil {
 		return Listing{}, err
 	}
-	active, err := s.enabled(ctx, org)
+	enabled, err := s.enabled(ctx, org)
 	if err != nil {
 		return Listing{}, err
 	}
-	all, err := s.all(ctx, org, active)
+	all, err := s.All(ctx, org)
 	if err != nil {
 		return Listing{}, err
 	}
@@ -181,7 +171,7 @@ func (s *Service) List(ctx context.Context) (Listing, error) {
 	}
 	out := Listing{
 		Roles: all, Users: make(map[string]int, len(all)), Permissions: slices.Clone(s.catalog),
-		Custom: Custom{Enabled: active, Count: len(all) - len(s.builtins), Max: s.opts.MaxCustom},
+		Custom: Custom{Enabled: enabled, Count: len(all) - len(s.builtins), Max: s.opts.MaxCustom},
 	}
 	for _, r := range all {
 		out.Users[r.Key] = counts[r.Key]
@@ -192,7 +182,7 @@ func (s *Service) List(ctx context.Context) (Listing, error) {
 // Create membuat role buatan. Galatnya berjenis appkit.KindQuotaExceeded bila
 // paket organization itu tidak menyertakan role buatan.
 func (s *Service) Create(ctx context.Context, in Input) (Role, error) {
-	org, actor, err := s.begin(ctx)
+	org, err := s.begin(ctx)
 	if err != nil {
 		return Role{}, err
 	}
@@ -242,13 +232,13 @@ func (s *Service) Create(ctx context.Context, in Input) (Role, error) {
 	if err != nil {
 		return Role{}, fmt.Errorf("roles: menyimpan role: %w", err)
 	}
-	if err := record(ctx, tx, org, r.id, actor, ActionCreated, nil, in.snapshot()); err != nil {
+	if err := s.record(ctx, tx, ActionCreated, r.id, fmt.Sprintf("Role “%s” dibuat.", r.name), nil, in.snapshot()); err != nil {
 		return Role{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Role{}, err
 	}
-	return s.role(r, true), nil
+	return s.role(r), nil
 }
 
 // Update menyimpan seluruh isian role buatan key (bukan sebagian). Audiensnya
@@ -257,7 +247,7 @@ func (s *Service) Create(ctx context.Context, in Input) (Role, error) {
 // in.Version harus sama dengan Version role yang dibaca; bila sudah berubah
 // sejak itu, simpan ditolak dengan galat KindConflict.
 func (s *Service) Update(ctx context.Context, key string, in Input) (Role, error) {
-	org, actor, err := s.begin(ctx)
+	org, err := s.begin(ctx)
 	if err != nil {
 		return Role{}, err
 	}
@@ -308,26 +298,26 @@ func (s *Service) Update(ctx context.Context, key string, in Input) (Role, error
 	if err != nil {
 		return Role{}, fmt.Errorf("roles: menyimpan role: %w", err)
 	}
-	if err := record(ctx, tx, org, id, actor, ActionUpdated, before, in.snapshot()); err != nil {
+	if err := s.record(ctx, tx, ActionUpdated, id, fmt.Sprintf("Role “%s” diubah.", r.name), before, in.snapshot()); err != nil {
 		return Role{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Role{}, err
 	}
-	return s.role(r, true), nil
+	return s.role(r), nil
 }
 
 // Delete menghapus role buatan key. Role yang masih dipegang pengguna
 // ditolak. Menghapus tetap boleh di organization yang paketnya tidak lagi
 // menyertakan role buatan.
 //
-// Pemeriksaan pemegangnya tidak atomik dengan pemberian role di produk: role
-// yang diberikan tepat saat dihapus menjadi Key tanpa role, yang tidak
-// memegang izin apa pun (PermissionsOf). Produk yang ingin database
-// menolaknya memasang foreign key ke appkit_roles (organization_id, id);
-// pelanggarannya dijawab dengan galat yang sama.
+// Dengan Options.LockAssignments, menghapus dan memberikan role tidak pernah
+// berselang. Tanpanya, role yang diberikan tepat saat dihapus menjadi Key
+// tanpa role, yang tidak memegang izin apa pun (PermissionsOf). Produk yang
+// memasang foreign key ke appkit_roles (organization_id, id) mendapat galat
+// yang sama saat database menolak penghapusannya.
 func (s *Service) Delete(ctx context.Context, key string) error {
-	org, actor, err := s.begin(ctx)
+	org, err := s.begin(ctx)
 	if err != nil {
 		return err
 	}
@@ -338,6 +328,21 @@ func (s *Service) Delete(ctx context.Context, key string) error {
 	if !ok {
 		return errNotFound
 	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Kunci dulu, baru hitung: pemberian role yang sedang berjalan selesai
+	// sebelum pemegangnya dihitung, dan yang datang sesudahnya menunggu sampai
+	// role ini sudah tidak ada.
+	if s.opts.LockAssignments != nil {
+		if err := s.opts.LockAssignments(ctx, tx, org); err != nil {
+			return fmt.Errorf("roles: mengunci pemberian role: %w", err)
+		}
+	}
 	counts, err := s.opts.UserCounts(ctx, org)
 	if err != nil {
 		return fmt.Errorf("roles: menghitung pemegang role: %w", err)
@@ -346,12 +351,6 @@ func (s *Service) Delete(ctx context.Context, key string) error {
 		return appkit.Validation(fmt.Sprintf(
 			"Role ini masih dipakai %d pengguna. Pindahkan mereka ke role lain lebih dulu.", n))
 	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
 
 	r := stored{id: id}
 	var audience string
@@ -368,20 +367,25 @@ func (s *Service) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("roles: menghapus role: %w", err)
 	}
 	r.audience = Audience(audience)
-	if err := record(ctx, tx, org, id, actor, ActionDeleted, r.snapshot(), nil); err != nil {
+	if err := s.record(ctx, tx, ActionDeleted, id, fmt.Sprintf("Role “%s” dihapus.", r.name), r.snapshot(), nil); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 
-// Tindakan yang dicatat.
+// Nama tindakan di jejak audit, kelompok audit.CategoryAccess. Target-nya
+// {Type: TargetType, ID: Role.Key}.
 const (
-	ActionCreated = "created"
-	ActionUpdated = "updated"
-	ActionDeleted = "deleted"
+	ActionCreated = "role.created"
+	ActionUpdated = "role.updated"
+	ActionDeleted = "role.deleted"
+
+	TargetType = "role"
 )
 
-// Snapshot adalah isi sebuah role pada satu saat.
+// Snapshot adalah isi sebuah role pada satu saat. Catatan jejak audit sebuah
+// perubahan role membawanya di Details sebagai "before" dan "after";
+// pembuatan hanya "after", penghapusan hanya "before".
 type Snapshot struct {
 	Name        string              `json:"name"`
 	Description string              `json:"description"`
@@ -389,108 +393,19 @@ type Snapshot struct {
 	Permissions []appkit.Permission `json:"permissions"`
 }
 
-// Event adalah satu catatan perubahan role.
-type Event struct {
-	ID uuid.UUID `json:"id"`
-	// Action: ActionCreated, ActionUpdated, atau ActionDeleted.
-	Action string `json:"action"`
-	// RoleKey tetap terisi setelah rolenya dihapus.
-	RoleKey string `json:"role_key"`
-	// RoleName adalah nama role sesudah perubahan; untuk penghapusan, nama
-	// terakhirnya.
-	RoleName string `json:"role_name"`
-	// ActorID adalah id pengguna di dalam produk (Hooks.User).
-	ActorID uuid.UUID `json:"actor_id"`
-	// Before null untuk pembuatan; After null untuk penghapusan.
-	Before    *Snapshot `json:"before"`
-	After     *Snapshot `json:"after"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
 // record mencatat satu perubahan di transaksi yang sama dengan perubahannya:
 // perubahan tanpa catatan tidak pernah tersimpan.
-func record(ctx context.Context, tx pgx.Tx, org, role, actor uuid.UUID, action string, before, after *Snapshot) error {
-	states := [2][]byte{}
-	for i, state := range []*Snapshot{before, after} {
-		if state == nil {
-			continue
-		}
-		raw, err := json.Marshal(state)
-		if err != nil {
-			return err
-		}
-		states[i] = raw
+func (s *Service) record(ctx context.Context, tx pgx.Tx, action string, role uuid.UUID, summary string, before, after *Snapshot) error {
+	details := map[string]any{}
+	if before != nil {
+		details["before"] = before
 	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return err
+	if after != nil {
+		details["after"] = after
 	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO appkit_role_events (id, organization_id, role_id, action, actor_id, old_state, new_state)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		id, org, role, action, actor, states[0], states[1]); err != nil {
-		return fmt.Errorf("roles: mencatat perubahan role: %w", err)
-	}
-	return nil
-}
-
-const (
-	defaultEvents = 50
-	maxEvents     = 200
-)
-
-// Events mengembalikan catatan perubahan role organization request ini,
-// terbaru dulu. limit di bawah satu memakai bawaan (50); paling banyak 200.
-func (s *Service) Events(ctx context.Context, limit int) ([]Event, error) {
-	if err := s.hooks.Authorize(ctx, Manage); err != nil {
-		return nil, err
-	}
-	org, err := s.hooks.Organization(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if limit < 1 {
-		limit = defaultEvents
-	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, role_id, action, actor_id, old_state, new_state, created_at
-		FROM appkit_role_events
-		WHERE organization_id = $1
-		ORDER BY created_at DESC, id DESC
-		LIMIT $2`, org, min(limit, maxEvents))
-	if err != nil {
-		return nil, fmt.Errorf("roles: membaca catatan perubahan: %w", err)
-	}
-	defer rows.Close()
-	out := []Event{}
-	for rows.Next() {
-		var (
-			e          Event
-			role       uuid.UUID
-			old, fresh []byte
-		)
-		if err := rows.Scan(&e.ID, &role, &e.Action, &e.ActorID, &old, &fresh, &e.CreatedAt); err != nil {
-			return nil, fmt.Errorf("roles: membaca catatan perubahan: %w", err)
-		}
-		e.RoleKey = role.String()
-		for _, state := range []struct {
-			raw    []byte
-			target **Snapshot
-		}{{old, &e.Before}, {fresh, &e.After}} {
-			if state.raw == nil {
-				continue
-			}
-			var snap Snapshot
-			if err := json.Unmarshal(state.raw, &snap); err != nil {
-				return nil, fmt.Errorf("roles: catatan perubahan %s rusak: %w", e.ID, err)
-			}
-			*state.target = &snap
-			e.RoleName = snap.Name
-		}
-		out = append(out, e)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("roles: membaca catatan perubahan: %w", err)
-	}
-	return out, nil
+	return s.trail.RecordTx(ctx, tx, audit.Entry{
+		Category: audit.CategoryAccess, Action: action,
+		Target:  audit.Target{Type: TargetType, ID: role.String()},
+		Summary: summary, Details: details,
+	})
 }

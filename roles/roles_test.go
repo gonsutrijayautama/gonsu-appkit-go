@@ -13,9 +13,11 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	appkit "github.com/gonsutrijayautama/gonsu-appkit-go"
+	"github.com/gonsutrijayautama/gonsu-appkit-go/audit"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/internal/testdb"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/roles"
 )
@@ -54,6 +56,7 @@ func builtins() []roles.Builtin {
 // jumlah pemegang tiap role.
 type fixture struct {
 	pool  *pgxpool.Pool
+	trail *audit.Service
 	roles *roles.Service
 
 	mu       sync.Mutex
@@ -82,11 +85,12 @@ func (f *fixture) options() roles.Options {
 func setup(t *testing.T, change ...func(*roles.Options)) *fixture {
 	t.Helper()
 	f := &fixture{pool: testdb.New(t), disabled: map[uuid.UUID]bool{}, holders: map[uuid.UUID]map[string]int{}}
+	f.trail = testdb.Trail(t, f.pool)
 	opts := f.options()
 	for _, c := range change {
 		c(&opts)
 	}
-	s, err := roles.New(f.pool, testdb.Hooks(), opts)
+	s, err := roles.New(f.pool, f.trail, testdb.Hooks(), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +205,7 @@ func TestBuiltins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if len(l.Roles) != 3 || l.Roles[0].Key != "administrator" || !l.Roles[0].Builtin || !l.Roles[0].Active ||
+	if len(l.Roles) != 3 || l.Roles[0].Key != "administrator" || !l.Roles[0].Builtin ||
 		l.Roles[0].Version != 0 || l.Roles[0].UpdatedAt != nil || l.Roles[2].Audience != roles.AudienceExternal {
 		t.Errorf("role bawaan di daftar = %+v", l.Roles)
 	}
@@ -229,7 +233,7 @@ func TestCreate(t *testing.T) {
 	if r.Audience != roles.AudienceInternal || !slices.Equal(r.Permissions, []appkit.Permission{notesRead, notesWrite}) {
 		t.Errorf("role = %+v", r)
 	}
-	if r.Builtin || !r.Active || r.Version != 1 || r.UpdatedAt == nil {
+	if r.Builtin || r.Version != 1 || r.UpdatedAt == nil {
 		t.Errorf("role = %+v", r)
 	}
 	if _, err := uuid.Parse(r.Key); err != nil {
@@ -310,8 +314,8 @@ func TestCreateValidation(t *testing.T) {
 	if l, _ := f.roles.List(ctx); l.Custom.Count != 1 {
 		t.Errorf("isian yang tidak sah tersimpan: %+v", l.Roles)
 	}
-	if events, _ := f.roles.Events(ctx, 0); len(events) != 1 {
-		t.Errorf("isian yang tidak sah tercatat: %+v", events)
+	if actions := testdb.Actions(t, f.trail, org); len(actions) != 1 {
+		t.Errorf("isian yang tidak sah tercatat: %v", actions)
 	}
 }
 
@@ -370,16 +374,19 @@ func TestOnlyManageMayChange(t *testing.T) {
 		if err := f.roles.Delete(ctx, r.Key); !errors.Is(err, want) {
 			t.Errorf("Delete %s = %v", name, err)
 		}
-		if _, err := f.roles.Events(ctx, 0); !errors.Is(err, want) {
-			t.Errorf("Events %s = %v", name, err)
-		}
 	}
 
 	// Pemegang izin tanpa identitas pengguna tidak dapat mengubah: perubahan
-	// tanpa pelaku tidak pernah tercatat.
+	// tanpa pelaku tidak pernah tersimpan.
 	anonymous := testdb.With(context.Background(), testdb.Session{Organization: org, Permissions: []appkit.Permission{roles.Manage}})
 	if _, err := f.roles.Create(anonymous, in); !errors.Is(err, testdb.ErrNoSession) {
 		t.Errorf("Create tanpa pengguna = %v", err)
+	}
+	if _, err := f.roles.Update(anonymous, r.Key, in); !errors.Is(err, testdb.ErrNoSession) {
+		t.Errorf("Update tanpa pengguna = %v", err)
+	}
+	if err := f.roles.Delete(anonymous, r.Key); !errors.Is(err, testdb.ErrNoSession) {
+		t.Errorf("Delete tanpa pengguna = %v", err)
 	}
 
 	l, err := f.roles.List(admin(org))
@@ -413,8 +420,8 @@ func TestTenantIsolation(t *testing.T) {
 	if err := f.roles.Delete(admin(b), r.Key); kind(err) != appkit.KindNotFound {
 		t.Errorf("Delete lintas organization = %v, ingin tidak ditemukan", err)
 	}
-	if events, err := f.roles.Events(admin(b), 0); err != nil || len(events) != 0 {
-		t.Errorf("organization B melihat catatan A: %+v, %v", events, err)
+	if actions := testdb.Actions(t, f.trail, b); len(actions) != 0 {
+		t.Errorf("percobaan organization B tercatat: %v", actions)
 	}
 
 	// Nama yang sama boleh dipakai organization lain, dan batasnya terpisah.
@@ -423,14 +430,15 @@ func TestTenantIsolation(t *testing.T) {
 	if got, err := f.roles.Get(context.Background(), a, r.Key); err != nil || got.Name != "Kasir" || got.Version != 1 {
 		t.Errorf("role A berubah oleh organization B: %+v, %v", got, err)
 	}
-	if events, _ := f.roles.Events(admin(a), 0); len(events) != 1 {
-		t.Errorf("catatan A = %+v", events)
+	if actions := testdb.Actions(t, f.trail, a); len(actions) != 1 {
+		t.Errorf("catatan A = %v", actions)
 	}
 }
 
 func TestBuiltinsCannotBeChanged(t *testing.T) {
 	f := setup(t)
-	ctx := admin(uuid.New())
+	org := uuid.New()
+	ctx := admin(org)
 
 	for _, key := range []string{"administrator", "staff", "customer"} {
 		_, err := f.roles.Update(ctx, key, roles.Input{Name: "Lain", Permissions: []appkit.Permission{notesRead}})
@@ -441,8 +449,8 @@ func TestBuiltinsCannotBeChanged(t *testing.T) {
 			t.Errorf("Delete role bawaan %s = %v", key, err)
 		}
 	}
-	if events, _ := f.roles.Events(ctx, 0); len(events) != 0 {
-		t.Errorf("percobaan mengubah role bawaan tercatat: %+v", events)
+	if actions := testdb.Actions(t, f.trail, org); len(actions) != 0 {
+		t.Errorf("percobaan mengubah role bawaan tercatat: %v", actions)
 	}
 }
 
@@ -555,13 +563,15 @@ func TestDeleteRejectedByProductForeignKey(t *testing.T) {
 	if err := f.roles.Delete(ctx, r.Key); kind(err) != appkit.KindValidation {
 		t.Errorf("Delete yang ditolak foreign key = %v", err)
 	}
-	if events, _ := f.roles.Events(ctx, 0); len(events) != 1 {
-		t.Errorf("penghapusan yang gagal tercatat: %+v", events)
+	if actions := testdb.Actions(t, f.trail, org); len(actions) != 1 {
+		t.Errorf("penghapusan yang gagal tercatat: %v", actions)
 	}
 }
 
-// Role buatan adalah fitur paket. Tanpanya role buatan mati; role bawaan
-// tetap berjalan.
+// Role buatan adalah fitur paket, dan yang dijual adalah kemampuan MENYUSUN.
+// Tanpa hak pakai, role buatan tidak dapat dibuat atau diubah, tetapi yang
+// sudah ada tetap berlaku: organization yang turun paket tidak boleh
+// mendapati stafnya terkunci seketika.
 func TestCustomRolesNeedTheEntitlement(t *testing.T) {
 	f := setup(t)
 	org := uuid.New()
@@ -584,41 +594,30 @@ func TestCustomRolesNeedTheEntitlement(t *testing.T) {
 		t.Errorf("Update tanpa hak pakai = %v", err)
 	}
 
-	// Role buatan yang ada tidak memberi izin apa pun, dan terbaca tidak aktif.
-	if got := f.permissions(t, org, r.Key); len(got) != 0 {
-		t.Errorf("role buatan tanpa hak pakai memberi izin: %v", got)
+	// Role buatan yang sudah ada tetap berlaku dan tetap dapat diberikan.
+	if got := f.permissions(t, org, r.Key); !slices.Equal(got, []appkit.Permission{notesRead}) {
+		t.Errorf("role buatan tanpa hak pakai = %v, ingin tetap berlaku", got)
 	}
-	got, err := f.roles.Get(context.Background(), org, r.Key)
-	if err != nil || got.Active || len(got.Permissions) != 1 {
+	if got, err := f.roles.Get(context.Background(), org, r.Key); err != nil || len(got.Permissions) != 1 {
 		t.Errorf("Get tanpa hak pakai = %+v, %v", got, err)
 	}
 	l, err := f.roles.List(ctx)
-	if err != nil || l.Custom.Enabled || l.Custom.Count != 1 || l.Roles[3].Active || !l.Roles[0].Active {
+	if err != nil || l.Custom.Enabled || l.Custom.Count != 1 || len(l.Roles[3].Permissions) != 1 {
 		t.Errorf("List tanpa hak pakai = %+v, %v", l, err)
 	}
 
-	// Role bawaan tetap berjalan, dan organization lain tidak terpengaruh.
-	if got := f.permissions(t, org, "staff"); len(got) != 2 {
-		t.Errorf("role bawaan tanpa hak pakai = %v", got)
-	}
-	other := uuid.New()
-	f.create(t, admin(other), roles.Input{Name: "Kasir", Permissions: in.Permissions})
-
-	// Paketnya kembali: role buatan berlaku lagi tanpa disusun ulang.
-	f.disable(org, false)
-	if got := f.permissions(t, org, r.Key); len(got) != 1 {
-		t.Errorf("role buatan sesudah hak pakai kembali = %v", got)
-	}
+	// Organization lain tidak terpengaruh.
+	f.create(t, admin(uuid.New()), roles.Input{Name: "Kasir", Permissions: in.Permissions})
 
 	// Menghapus tetap boleh tanpa hak pakai.
-	f.disable(org, true)
 	if err := f.roles.Delete(ctx, r.Key); err != nil {
 		t.Errorf("Delete tanpa hak pakai = %v", err)
 	}
 }
 
-// Hak pakai yang tidak terbaca adalah galat, bukan "boleh" dan bukan "tidak
-// ada role": pemanggil harus tahu jawabannya tidak dapat dipercaya.
+// Hak pakai hanya dibaca saat menyusun role. Saat ia tidak terbaca, menyusun
+// gagal, tetapi pemeriksaan izin tidak: hak pakai yang gagal dibaca tidak
+// dapat mengunci siapa pun.
 func TestEntitlementFailure(t *testing.T) {
 	f := setup(t)
 	org := uuid.New()
@@ -630,21 +629,30 @@ func TestEntitlementFailure(t *testing.T) {
 	f.failing = boom
 	f.mu.Unlock()
 
-	if _, err := f.roles.PermissionsOf(context.Background(), org, r.Key); !errors.Is(err, boom) {
-		t.Errorf("PermissionsOf = %v", err)
-	}
-	if ok, err := f.roles.Can(context.Background(), org, r.Key, notesRead); ok || !errors.Is(err, boom) {
-		t.Errorf("Can = %v, %v", ok, err)
-	}
 	if _, err := f.roles.Create(ctx, roles.Input{Name: "Gudang", Permissions: []appkit.Permission{notesRead}}); !errors.Is(err, boom) {
 		t.Errorf("Create = %v", err)
+	}
+	if _, err := f.roles.Update(ctx, r.Key, roles.Input{Name: "Kasir", Permissions: []appkit.Permission{notesRead}, Version: r.Version}); !errors.Is(err, boom) {
+		t.Errorf("Update = %v", err)
 	}
 	if _, err := f.roles.List(ctx); !errors.Is(err, boom) {
 		t.Errorf("List = %v", err)
 	}
-	// Role bawaan tidak bergantung pada hak pakai.
+
+	if got := f.permissions(t, org, r.Key); !slices.Equal(got, []appkit.Permission{notesRead}) {
+		t.Errorf("PermissionsOf role buatan saat hak pakai tidak terbaca = %v", got)
+	}
+	if ok, err := f.roles.Can(context.Background(), org, r.Key, notesRead); !ok || err != nil {
+		t.Errorf("Can = %v, %v", ok, err)
+	}
 	if got := f.permissions(t, org, "administrator"); len(got) != 4 {
 		t.Errorf("role bawaan saat hak pakai tidak terbaca = %v", got)
+	}
+	if all, err := f.roles.All(context.Background(), org); err != nil || len(all) != 4 {
+		t.Errorf("All = %+v, %v", all, err)
+	}
+	if err := f.roles.Delete(ctx, r.Key); err != nil {
+		t.Errorf("Delete = %v", err)
 	}
 }
 
@@ -723,7 +731,7 @@ func TestStoredPermissionsFollowTheCatalog(t *testing.T) {
 		{Name: portalView, Label: "Melihat pesanan sendiri", Audience: roles.AudienceExternal},
 	}
 	opts.Builtins = []roles.Builtin{{Key: "administrator", Name: "Administrator", Administrator: true}}
-	next, err := roles.New(f.pool, testdb.Hooks(), opts)
+	next, err := roles.New(f.pool, f.trail, testdb.Hooks(), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -751,7 +759,63 @@ func TestStoredPermissionsFollowTheCatalog(t *testing.T) {
 	}
 }
 
-func TestEvents(t *testing.T) {
+// Menghapus role dan memberikannya ke pengguna tidak pernah berselang: Delete
+// mengambil kunci pemberian role milik produk SEBELUM menghitung pemegangnya,
+// di transaksi penghapusannya.
+func TestDeleteLocksAssignments(t *testing.T) {
+	org := uuid.New()
+	var (
+		order  []string
+		locked uuid.UUID
+		fail   error
+	)
+	var f *fixture
+	f = setup(t, func(o *roles.Options) {
+		counts := o.UserCounts
+		o.UserCounts = func(ctx context.Context, org uuid.UUID) (map[string]int, error) {
+			order = append(order, "count")
+			return counts(ctx, org)
+		}
+		o.LockAssignments = func(ctx context.Context, tx pgx.Tx, org uuid.UUID) error {
+			order = append(order, "lock")
+			locked = org
+			if fail != nil {
+				return fail
+			}
+			// Kunci diambil di transaksi penghapusan, bukan koneksi lain.
+			_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('users.grant.' || $1::text))`, org)
+			return err
+		}
+	})
+	ctx := admin(org)
+	r := f.create(t, ctx, roles.Input{Name: "Kasir", Permissions: []appkit.Permission{notesRead}})
+
+	// Kunci yang gagal diambil membatalkan penghapusan.
+	fail = errors.New("kunci tidak didapat")
+	if err := f.roles.Delete(ctx, r.Key); !errors.Is(err, fail) {
+		t.Errorf("Delete saat kunci gagal = %v", err)
+	}
+	if _, err := f.roles.Get(context.Background(), org, r.Key); err != nil {
+		t.Errorf("role terhapus walau kunci gagal: %v", err)
+	}
+
+	fail, order = nil, nil
+	if err := f.roles.Delete(ctx, r.Key); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if !slices.Equal(order, []string{"lock", "count"}) || locked != org {
+		t.Errorf("urutan = %v untuk %s, ingin kunci lalu hitung", order, locked)
+	}
+
+	// List tidak mengunci: ia hanya membaca.
+	order = nil
+	if _, err := f.roles.List(ctx); err != nil || !slices.Equal(order, []string{"count"}) {
+		t.Errorf("List = %v, urutan %v", err, order)
+	}
+}
+
+// Setiap perubahan role masuk jejak audit, di transaksi yang sama.
+func TestChangesAreRecorded(t *testing.T) {
 	f := setup(t)
 	org := uuid.New()
 	creator, editor := uuid.New(), uuid.New()
@@ -769,30 +833,31 @@ func TestEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events, err := f.roles.Events(as(creator), 0)
-	if err != nil || len(events) != 3 {
-		t.Fatalf("Events = %+v, %v", events, err)
+	events := testdb.Recorded(t, f.trail, org)
+	if len(events) != 3 {
+		t.Fatalf("catatan = %+v", events)
 	}
-	// Terbaru dulu.
-	deleted, updated, created := events[0], events[1], events[2]
-
-	if created.Action != roles.ActionCreated || created.ActorID != creator || created.RoleKey != r.Key ||
-		created.Before != nil || created.After == nil || created.After.Name != "Kasir" || created.RoleName != "Kasir" {
-		t.Errorf("catatan pembuatan = %+v", created)
-	}
-	if updated.Action != roles.ActionUpdated || updated.ActorID != editor || updated.RoleName != "Kasir Senior" ||
-		updated.Before == nil || updated.Before.Name != "Kasir" || !slices.Equal(updated.Before.Permissions, []appkit.Permission{notesRead}) ||
-		updated.After == nil || !slices.Equal(updated.After.Permissions, []appkit.Permission{notesRead, notesWrite}) {
-		t.Errorf("catatan perubahan = %+v", updated)
-	}
-	// Catatan bertahan setelah rolenya dihapus, dan menyebut nama terakhirnya.
-	if deleted.Action != roles.ActionDeleted || deleted.RoleKey != r.Key || deleted.RoleName != "Kasir Senior" ||
-		deleted.Before == nil || deleted.Before.Audience != roles.AudienceInternal || deleted.After != nil {
-		t.Errorf("catatan penghapusan = %+v", deleted)
-	}
-
-	if events, _ := f.roles.Events(as(creator), 2); len(events) != 2 || events[0].Action != roles.ActionDeleted {
-		t.Errorf("Events dengan limit 2 = %+v", events)
+	for i, want := range []struct {
+		action  string
+		actor   uuid.UUID
+		summary string
+		details string
+	}{
+		{roles.ActionCreated, creator, "Role “Kasir” dibuat.",
+			`{"after":{"audience":"internal","description":"","name":"Kasir","permissions":["notes.read"]}}`},
+		{roles.ActionUpdated, editor, "Role “Kasir Senior” diubah.",
+			`{"after":{"audience":"internal","description":"","name":"Kasir Senior","permissions":["notes.read","notes.write"]},` +
+				`"before":{"audience":"internal","description":"","name":"Kasir","permissions":["notes.read"]}}`},
+		// Catatan bertahan setelah rolenya dihapus, dan menyebut isi terakhirnya.
+		{roles.ActionDeleted, editor, "Role “Kasir Senior” dihapus.",
+			`{"before":{"audience":"internal","description":"","name":"Kasir Senior","permissions":["notes.read","notes.write"]}}`},
+	} {
+		e := events[i]
+		details, _ := json.Marshal(e.Details)
+		if e.Action != want.action || e.Category != audit.CategoryAccess || e.ActorID == nil || *e.ActorID != want.actor ||
+			e.Target != (audit.Target{Type: roles.TargetType, ID: r.Key}) || e.Summary != want.summary || string(details) != want.details {
+			t.Errorf("catatan %d = %+v\nrincian %s", i, e, details)
+		}
 	}
 }
 
@@ -815,7 +880,6 @@ func TestRoutes(t *testing.T) {
 		{http.MethodPost, "/v1/roles"},
 		{http.MethodPut, "/v1/roles/" + uuid.NewString()},
 		{http.MethodDelete, "/v1/roles/" + uuid.NewString()},
-		{http.MethodGet, "/v1/role-events"},
 	} {
 		// Body sengaja bukan JSON: izin diperiksa sebelum body dibaca.
 		if code, _ := do(staff(org), tc.method, tc.path, "bukan json"); code != http.StatusForbidden {
@@ -832,7 +896,7 @@ func TestRoutes(t *testing.T) {
 	}
 	// Bentuk JSON-nya tetap lengkap: klien tidak perlu menebak field yang hilang.
 	for _, field := range []string{
-		`"key":"administrator"`, `"builtin":true`, `"active":true`, `"updated_at":null`, `"users":{`,
+		`"key":"administrator"`, `"builtin":true`, `"updated_at":null`, `"users":{`,
 		`"name":"settings.roles.manage"`, `"sensitive":true`, `"audience":"external"`,
 		`"custom":{"enabled":true,"count":0,"max":30}`,
 	} {
@@ -888,33 +952,24 @@ func TestRoutes(t *testing.T) {
 		t.Errorf("DELETE kedua = %d, ingin 404", code)
 	}
 
-	code, raw = do(admin(org), http.MethodGet, "/v1/role-events?limit=2", "")
-	var events struct {
-		Data []roles.Event `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(raw), &events); err != nil || code != http.StatusOK || len(events.Data) != 2 || events.Data[0].Action != roles.ActionDeleted {
-		t.Errorf("GET /role-events = %d, %s", code, raw)
-	}
-	// Limit yang bukan angka jatuh ke bawaan.
-	if code, _ := do(admin(org), http.MethodGet, "/v1/role-events?limit=semua", ""); code != http.StatusOK {
-		t.Errorf("GET /role-events dengan limit salah = %d", code)
+	if actions := testdb.Actions(t, f.trail, org); !slices.Equal(actions, []string{roles.ActionCreated, roles.ActionUpdated, roles.ActionDeleted}) {
+		t.Errorf("tindakan tercatat = %v", actions)
 	}
 }
 
 // Susunan yang melanggar pagar gagal saat start, bukan saat dipakai.
 func TestNewRejectsInvalidSetup(t *testing.T) {
 	pool := testdb.New(t)
+	trail := testdb.Trail(t, pool)
 	f := &fixture{}
-	noUser := testdb.Hooks()
-	noUser.User = nil
 
-	if _, err := roles.New(nil, testdb.Hooks(), f.options()); err == nil {
+	if _, err := roles.New(nil, trail, testdb.Hooks(), f.options()); err == nil {
 		t.Error("New tanpa pool lolos")
 	}
-	if _, err := roles.New(pool, noUser, f.options()); err == nil {
-		t.Error("New tanpa Hooks.User lolos")
+	if _, err := roles.New(pool, nil, testdb.Hooks(), f.options()); err == nil {
+		t.Error("New tanpa jejak audit lolos")
 	}
-	if _, err := roles.New(pool, appkit.Hooks{}, f.options()); err == nil {
+	if _, err := roles.New(pool, trail, appkit.Hooks{}, f.options()); err == nil {
 		t.Error("New tanpa pengait lolos")
 	}
 
@@ -978,7 +1033,7 @@ func TestNewRejectsInvalidSetup(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			opts := f.options()
 			change(&opts)
-			if _, err := roles.New(pool, testdb.Hooks(), opts); err == nil {
+			if _, err := roles.New(pool, trail, testdb.Hooks(), opts); err == nil {
 				t.Error("susunan yang tidak sah lolos")
 			}
 		})
@@ -987,7 +1042,7 @@ func TestNewRejectsInvalidSetup(t *testing.T) {
 	// Role bawaan tanpa izin sama sekali sah: ia hanya dapat masuk.
 	opts := f.options()
 	opts.Builtins = append(opts.Builtins, roles.Builtin{Key: "guest", Name: "Tamu"})
-	if _, err := roles.New(pool, testdb.Hooks(), opts); err != nil {
+	if _, err := roles.New(pool, trail, testdb.Hooks(), opts); err != nil {
 		t.Errorf("role bawaan tanpa izin ditolak: %v", err)
 	}
 }

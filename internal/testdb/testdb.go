@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	appkit "github.com/gonsutrijayautama/gonsu-appkit-go"
+	"github.com/gonsutrijayautama/gonsu-appkit-go/audit"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/internal/httpjson"
 )
 
@@ -76,11 +77,46 @@ func Empty(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// Trail mengembalikan service jejak audit di pool, dengan pengait palsu.
+func Trail(t *testing.T, pool *pgxpool.Pool) *audit.Service {
+	t.Helper()
+	trail, err := audit.New(pool, Hooks(), audit.Options{})
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	return trail
+}
+
+// Recorded mengembalikan catatan jejak audit org, TERLAMA dulu: urutan
+// kejadiannya.
+func Recorded(t *testing.T, trail *audit.Service, org uuid.UUID) []audit.Event {
+	t.Helper()
+	ctx := With(context.Background(), Session{
+		Organization: org, User: uuid.New(), Permissions: []appkit.Permission{audit.View},
+	})
+	page, err := trail.List(ctx, audit.Query{Limit: 200})
+	if err != nil {
+		t.Fatalf("membaca jejak audit: %v", err)
+	}
+	slices.Reverse(page.Data)
+	return page.Data
+}
+
+// Actions mengembalikan nama tindakan yang tercatat untuk org, terlama dulu.
+func Actions(t *testing.T, trail *audit.Service, org uuid.UUID) []string {
+	t.Helper()
+	out := []string{}
+	for _, e := range Recorded(t, trail, org) {
+		out = append(out, e.Action)
+	}
+	return out
+}
+
 // Session adalah sesi palsu sebuah request: organization, pengguna, dan izin
 // yang dipegangnya.
 type Session struct {
 	Organization uuid.UUID
-	// User hanya dibaca modul yang mencatat pelaku (roles).
+	// User dibaca jejak audit: setiap perubahan mencatat pelakunya.
 	User        uuid.UUID
 	Permissions []appkit.Permission
 }
