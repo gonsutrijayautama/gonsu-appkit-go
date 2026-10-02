@@ -81,6 +81,9 @@ type Profile struct {
 	// AddressText adalah alamat lengkap satu baris: Address, wilayah, kode pos.
 	AddressText string      `json:"address_text"`
 	Logo        *media.File `json:"logo"`
+	// Version dikirim balik saat menyimpan (Input.Version): simpan yang
+	// membawa version lama ditolak. 0 bila belum pernah disimpan.
+	Version int `json:"version"`
 	// UpdatedAt null bila belum ada yang pernah disimpan.
 	UpdatedAt *time.Time `json:"updated_at"`
 }
@@ -163,11 +166,11 @@ func (s *Service) Lookup(ctx context.Context, org uuid.UUID) (Profile, error) {
 	)
 	err := s.pool.QueryRow(ctx, `
 		SELECT display_name, industry, email, phone, business_type, legal_name, tax_id,
-		       address, region_code, postcode, logo_media_id, updated_at
+		       address, region_code, postcode, logo_media_id, version, updated_at
 		FROM appkit_business_profiles
 		WHERE organization_id = $1`, org).Scan(
 		&p.DisplayName, &p.Industry, &p.Email, &p.Phone, &p.BusinessType, &p.LegalName, &p.TaxID,
-		&p.Address, &p.RegionCode, &p.Postcode, &logo, &at)
+		&p.Address, &p.RegionCode, &p.Postcode, &logo, &p.Version, &at)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Profile{}, nil
 	}
@@ -187,8 +190,14 @@ func (s *Service) Lookup(ctx context.Context, org uuid.UUID) (Profile, error) {
 	return p, nil
 }
 
+// errChanged: profil sudah disimpan orang lain sejak dibaca.
+var errChanged = appkit.Conflict("Profil bisnis sudah diubah orang lain. Muat ulang halaman, lalu ulangi perubahan Anda.")
+
 // Update menyimpan seluruh isian profil (bukan sebagian): isian yang dikirim
 // kosong menjadi kosong. Logo tidak ikut berubah.
+//
+// in.Version harus sama dengan Version profil yang dibaca; bila profil sudah
+// berubah sejak itu, simpan ditolak dengan galat KindConflict.
 func (s *Service) Update(ctx context.Context, in Input) (Profile, error) {
 	if err := s.hooks.Authorize(ctx, Manage); err != nil {
 		return Profile{}, err
@@ -200,19 +209,40 @@ func (s *Service) Update(ctx context.Context, in Input) (Profile, error) {
 	if errs := in.normalize(); len(errs) > 0 {
 		return Profile{}, appkit.Validation("Isian belum lengkap.", errs...)
 	}
-	_, err = s.pool.Exec(ctx, `
+	// Baris baru hanya untuk version 0; baris yang ada hanya berubah bila
+	// version-nya masih yang dibaca pengirim. Tidak ada baris yang kembali
+	// berarti salah satunya tidak terpenuhi.
+	var version int
+	err = s.pool.QueryRow(ctx, `
 		INSERT INTO appkit_business_profiles (organization_id, display_name, industry, email, phone,
-			business_type, legal_name, tax_id, address, region_code, postcode)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			business_type, legal_name, tax_id, address, region_code, postcode, version)
+		SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 1 WHERE $12 = 0
 		ON CONFLICT (organization_id) DO UPDATE SET
 			display_name = EXCLUDED.display_name, industry = EXCLUDED.industry,
 			email = EXCLUDED.email, phone = EXCLUDED.phone,
 			business_type = EXCLUDED.business_type, legal_name = EXCLUDED.legal_name,
 			tax_id = EXCLUDED.tax_id, address = EXCLUDED.address,
 			region_code = EXCLUDED.region_code, postcode = EXCLUDED.postcode,
-			updated_at = now()`,
+			version = appkit_business_profiles.version + 1, updated_at = now()
+		WHERE appkit_business_profiles.version = 0
+		RETURNING version`,
 		org, in.DisplayName, in.Industry, in.Email, in.Phone,
-		in.BusinessType, in.LegalName, in.TaxID, in.Address, in.RegionCode, in.Postcode)
+		in.BusinessType, in.LegalName, in.TaxID, in.Address, in.RegionCode, in.Postcode, in.Version).Scan(&version)
+	if errors.Is(err, pgx.ErrNoRows) && in.Version > 0 {
+		err = s.pool.QueryRow(ctx, `
+			UPDATE appkit_business_profiles SET
+				display_name = $2, industry = $3, email = $4, phone = $5,
+				business_type = $6, legal_name = $7, tax_id = $8, address = $9,
+				region_code = $10, postcode = $11,
+				version = version + 1, updated_at = now()
+			WHERE organization_id = $1 AND version = $12
+			RETURNING version`,
+			org, in.DisplayName, in.Industry, in.Email, in.Phone,
+			in.BusinessType, in.LegalName, in.TaxID, in.Address, in.RegionCode, in.Postcode, in.Version).Scan(&version)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Profile{}, errChanged
+	}
 	if err != nil {
 		return Profile{}, fmt.Errorf("businessprofile: menyimpan profil: %w", err)
 	}

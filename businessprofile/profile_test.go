@@ -134,8 +134,12 @@ func TestUpdate(t *testing.T) {
 		t.Error("updated_at kosong setelah disimpan")
 	}
 
+	if p.Version != 1 {
+		t.Errorf("version sesudah simpan pertama = %d, ingin 1", p.Version)
+	}
+
 	// Menyimpan mengganti SELURUH isian: yang dikirim kosong menjadi kosong.
-	p, err = f.profiles.Update(admin(org), businessprofile.Input{DisplayName: "Toko Baju", RegionCode: "32.73"})
+	p, err = f.profiles.Update(admin(org), businessprofile.Input{DisplayName: "Toko Baju", RegionCode: "32.73", Version: p.Version})
 	if err != nil {
 		t.Fatalf("Update kedua: %v", err)
 	}
@@ -246,6 +250,44 @@ func TestTenantIsolation(t *testing.T) {
 	}
 }
 
+// Dua administrator membuka formulir yang sama: yang menyimpan belakangan
+// ditolak, bukan menimpa diam-diam.
+func TestUpdateRejectsStaleVersion(t *testing.T) {
+	f := setup(t)
+	ctx := admin(uuid.New())
+	conflict := func(err error) bool {
+		e, ok := errors.AsType[*appkit.Error](err)
+		return ok && e.Kind == appkit.KindConflict
+	}
+
+	first, err := f.profiles.Update(ctx, businessprofile.Input{DisplayName: "Toko"})
+	if err != nil || first.Version != 1 {
+		t.Fatalf("simpan pertama = %+v, %v", first, err)
+	}
+	// Formulir kedua masih memegang version 0.
+	if _, err := f.profiles.Update(ctx, businessprofile.Input{DisplayName: "Timpa"}); !conflict(err) {
+		t.Errorf("simpan dengan version 0 sesudah profil ada = %v, ingin konflik", err)
+	}
+	second, err := f.profiles.Update(ctx, businessprofile.Input{DisplayName: "Toko Baju", Version: first.Version})
+	if err != nil || second.Version != 2 {
+		t.Fatalf("simpan dengan version terbaru = %+v, %v", second, err)
+	}
+	if _, err := f.profiles.Update(ctx, businessprofile.Input{DisplayName: "Timpa", Version: first.Version}); !conflict(err) {
+		t.Errorf("simpan dengan version lama = %v, ingin konflik", err)
+	}
+	// Version yang belum pernah ada pun ditolak.
+	if _, err := f.profiles.Update(ctx, businessprofile.Input{DisplayName: "Timpa", Version: 99}); !conflict(err) {
+		t.Errorf("simpan dengan version 99 = %v, ingin konflik", err)
+	}
+	if p, _ := f.profiles.Get(ctx); p.DisplayName != "Toko Baju" || p.Version != 2 {
+		t.Errorf("profil sesudah simpan yang ditolak = %+v", p)
+	}
+	// Organization yang belum punya profil tidak dapat menyimpan dengan version > 0.
+	if _, err := f.profiles.Update(admin(uuid.New()), businessprofile.Input{DisplayName: "Baru", Version: 1}); !conflict(err) {
+		t.Errorf("profil baru dengan version 1 = %v, ingin konflik", err)
+	}
+}
+
 func TestLogo(t *testing.T) {
 	f := setup(t)
 	org := uuid.New()
@@ -260,6 +302,12 @@ func TestLogo(t *testing.T) {
 		t.Fatalf("logo = %+v", p.Logo)
 	}
 	first := p.Logo.ID
+
+	// Mengunggah logo tidak menaikkan version: formulir yang sedang terbuka
+	// tetap dapat disimpan.
+	if p.Version != 0 {
+		t.Errorf("version sesudah unggah logo = %d, ingin 0", p.Version)
+	}
 
 	// Menyimpan profil tidak menyentuh logo.
 	if p, err = f.profiles.Update(ctx, businessprofile.Input{DisplayName: "Toko"}); err != nil || p.Logo == nil || p.Logo.ID != first {

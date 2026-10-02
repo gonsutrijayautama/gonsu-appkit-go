@@ -24,6 +24,9 @@ type Input struct {
 	Address      string `json:"address"`
 	RegionCode   string `json:"region_code"`
 	Postcode     string `json:"postcode"`
+	// Version adalah Profile.Version yang dibaca sebelum mengubah; 0 untuk
+	// profil yang belum pernah disimpan.
+	Version int `json:"version"`
 }
 
 // Jenis usaha, sama dengan business_type di platform.
@@ -63,6 +66,10 @@ func (in *Input) normalize() []appkit.FieldError {
 		if utf8.RuneCountInString(value) > max {
 			fail(field, fmt.Sprintf("%s maksimal %d karakter.", label, max))
 		}
+	}
+
+	if in.Version < 0 {
+		fail("version", "Versi tidak sah.")
 	}
 
 	in.DisplayName = strings.TrimSpace(in.DisplayName)
