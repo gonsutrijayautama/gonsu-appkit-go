@@ -174,7 +174,7 @@ func Hooks() appkit.Hooks {
 					status = http.StatusBadRequest
 				case appkit.KindNotFound:
 					status = http.StatusNotFound
-				case appkit.KindConflict:
+				case appkit.KindConflict, appkit.KindIdempotencyConflict:
 					status = http.StatusConflict
 				case appkit.KindQuotaExceeded:
 					status = http.StatusPaymentRequired

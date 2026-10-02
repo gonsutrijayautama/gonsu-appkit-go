@@ -76,6 +76,34 @@ type Options struct {
 	// Batasnya lunak: dua unggahan yang tiba bersamaan dapat sama-sama lolos
 	// dan melewatinya sebesar satu berkas.
 	Quota func(ctx context.Context, org uuid.UUID) (limit int64, err error)
+	// OtherUsage mengembalikan byte yang sudah dipakai org DI LUAR package
+	// ini terhadap batas yang sama. Kosong: hanya berkas media yang dihitung.
+	//
+	// Kuota penyimpanan biasanya satu hak pakai untuk media dan lampiran
+	// (package attachments) sekaligus, jadi isinya biasanya pemakaian
+	// lampiran — dan attachments.Options punya OtherUsage yang sama untuk arah
+	// sebaliknya. Keduanya dipasang dengan closure, karena masing-masing butuh
+	// Usage milik yang lain:
+	//
+	//	var files *attachments.Service
+	//	logos, err := media.New(pool, hooks, media.Options{
+	//		Quota: quota,
+	//		OtherUsage: func(ctx context.Context, org uuid.UUID) (int64, error) {
+	//			u, err := files.Usage(ctx, org)
+	//			return u.Bytes, err
+	//		},
+	//	})
+	//	files, err = attachments.New(pool, attachments.Options{
+	//		Quota: quota,
+	//		OtherUsage: func(ctx context.Context, org uuid.UUID) (int64, error) {
+	//			u, err := logos.Usage(ctx, org)
+	//			return u.Bytes, err
+	//		},
+	//	})
+	//
+	// OtherUsage hanya dipanggil bila Quota memberi batas; galatnya
+	// menggagalkan unggahan.
+	OtherUsage func(ctx context.Context, org uuid.UUID) (bytes int64, err error)
 }
 
 // Service mengelola berkas media.
@@ -84,6 +112,7 @@ type Service struct {
 	store      Store
 	maxBytes   int64
 	quota      func(ctx context.Context, org uuid.UUID) (int64, error)
+	otherUsage func(ctx context.Context, org uuid.UUID) (int64, error)
 	writeError func(w http.ResponseWriter, r *http.Request, err error)
 }
 
@@ -96,20 +125,13 @@ func New(pool *pgxpool.Pool, hooks appkit.Hooks, opts Options) (*Service, error)
 	if err := hooks.Validate(); err != nil {
 		return nil, err
 	}
-	store := opts.Store
-	switch store.(type) {
-	case nil:
-		store = NewDBStore(pool)
-	case *DBStore:
-	default:
-		// Produk yang berpindah dari database ke penyimpanan lain tidak
-		// kehilangan berkas lamanya.
-		store = withFallback{primary: store, fallback: NewDBStore(pool)}
-	}
 	if opts.MaxBytes <= 0 {
 		opts.MaxBytes = DefaultMaxBytes
 	}
-	return &Service{pool: pool, store: store, maxBytes: opts.MaxBytes, quota: opts.Quota, writeError: hooks.WriteError}, nil
+	return &Service{
+		pool: pool, store: WithDBFallback(opts.Store, pool), maxBytes: opts.MaxBytes,
+		quota: opts.Quota, otherUsage: opts.OtherUsage, writeError: hooks.WriteError,
+	}, nil
 }
 
 // File adalah satu berkas media di API.
@@ -264,6 +286,16 @@ func (s *Service) checkQuota(ctx context.Context, org uuid.UUID, size int64, rep
 		FROM appkit_media WHERE organization_id = $1`, org, replaces).Scan(&used, &kept)
 	if err != nil {
 		return fmt.Errorf("media: menghitung pemakaian: %w", err)
+	}
+	if s.otherUsage != nil {
+		// Batasnya satu untuk seluruh berkas organization itu, bukan satu per
+		// package. Berkas replaces milik media, jadi tidak mengurangi yang ini.
+		other, err := s.otherUsage(ctx, org)
+		if err != nil {
+			return fmt.Errorf("media: membaca pemakaian lain: %w", err)
+		}
+		used += other
+		kept += other
 	}
 	if kept+size > limit {
 		return appkit.QuotaExceeded(fmt.Sprintf(

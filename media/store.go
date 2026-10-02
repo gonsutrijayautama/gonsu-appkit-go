@@ -70,6 +70,25 @@ func (s *DBStore) Delete(ctx context.Context, key string) error {
 	return err
 }
 
+// WithDBFallback mengembalikan penyimpanan yang dipakai sebuah service untuk
+// primary: primary kosong berarti database, dan primary yang bukan database
+// dibungkus supaya berkas yang isinya sudah telanjur di database tetap
+// terbaca dan tetap dapat dihapus.
+//
+// New memanggilnya sendiri; yang perlu memanggilnya hanya package lain yang
+// menyimpan isi berkasnya lewat Store, seperti attachments.
+func WithDBFallback(primary Store, pool *pgxpool.Pool) Store {
+	switch primary.(type) {
+	case nil:
+		return NewDBStore(pool)
+	case *DBStore, withFallback:
+		return primary
+	}
+	// Produk yang berpindah dari database ke penyimpanan lain tidak
+	// kehilangan berkas lamanya.
+	return withFallback{primary: primary, fallback: NewDBStore(pool)}
+}
+
 // withFallback menyimpan ke primary dan membaca dari primary, lalu dari
 // fallback bila berkasnya tidak ada di primary. Dipakai Service saat
 // penyimpanannya bukan database: berkas yang isinya tersimpan di database

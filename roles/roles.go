@@ -248,7 +248,7 @@ func (s *Service) loadBuiltins(defs []Builtin) error {
 	for _, b := range defs {
 		r := Role{
 			Key: b.Key, Name: strings.TrimSpace(b.Name), Description: strings.TrimSpace(b.Description),
-			Audience: b.Audience, Builtin: true,
+			Audience: b.Audience, Builtin: true, administrator: b.Administrator,
 		}
 		if r.Audience == "" {
 			r.Audience = AudienceInternal
@@ -359,6 +359,8 @@ type Role struct {
 	Version int `json:"version"`
 	// UpdatedAt null untuk role bawaan.
 	UpdatedAt *time.Time `json:"updated_at"`
+
+	administrator bool
 }
 
 // stored adalah satu baris appkit_roles.
@@ -423,6 +425,20 @@ func (s *Service) builtin(key string) (Role, bool) {
 	r := s.builtins[i]
 	r.Permissions = slices.Clone(r.Permissions)
 	return r, true
+}
+
+// Administrator mengembalikan role administrator bawaan: satu-satunya role
+// yang memegang izin Sensitive. Modul pengguna memakainya untuk menjaga
+// selalu ada minimal satu administrator aktif.
+func (s *Service) Administrator() Role {
+	for _, r := range s.builtins {
+		if r.administrator {
+			r.Permissions = slices.Clone(r.Permissions)
+			return r
+		}
+	}
+	// Tidak tercapai: New menolak susunan tanpa administrator.
+	return Role{}
 }
 
 // customID mengurai Key role buatan. Hanya bentuk UUID baku yang diterima:

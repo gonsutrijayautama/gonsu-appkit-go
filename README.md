@@ -8,11 +8,15 @@ disalin per produk:
 | paket | isi |
 |---|---|
 | `businessprofile` | profil bisnis organization: nama, kontak, identitas legal, alamat, logo |
-| `website` | halaman depan publik: tagline, layanan, kanal, SEO — dan penyisipannya ke HTML |
-| `media` | berkas publik (logo, gambar): di database atau object storage S3/R2, dengan kuota per organization |
+| `website` | identitas halaman depan publik: mode, tagline, kontak, kanal, pratinjau tautan — dan penyisipannya ke HTML |
+| `media` | berkas PUBLIK (logo, gambar): di database atau object storage S3/R2, dengan kuota per organization |
 | `regions` | wilayah Indonesia sampai desa beserta kode pos, untuk pemilih alamat |
 | `roles` | role per organization: role bawaan di kode, role buatan dari layar, dan izin yang berlaku bagi pemegangnya |
+| `users` | pengguna per organization: siapa berhak masuk dan dengan role apa, pemberian akses, dan batas pengguna |
 | `audit` | jejak audit per organization: siapa melakukan apa, kapan, dan dari alamat mana |
+| `idempotency` | mutasi yang diulang klien tidak menghasilkan dokumen ganda |
+| `numbering` | nomor dokumen apa pun: bentuk per organization, tanpa nomor kembar dan tanpa nomor lompat |
+| `attachments` | berkas privat (lampiran dokumen): hanya terbaca lewat dokumen pemiliknya |
 
 Project hasil `gonsu new` sudah memasangnya. Halaman frontend-nya ada di
 template `gonsu-cli`, bukan di sini.
@@ -49,7 +53,7 @@ if err := appkit.Migrate(ctx, pool, logger); err != nil {
 
 Library tidak meng-import kode produk. Produk menyerahkan pengait: tiga yang
 wajib bagi setiap modul, dan `User` yang diminta jejak audit — jadi wajib bagi
-produk yang memasang `businessprofile`, `website`, atau `roles`.
+produk yang memasang `businessprofile`, `website`, `roles`, atau `users`.
 
 ```go
 hooks := appkit.Hooks{
@@ -83,6 +87,8 @@ hooks := appkit.Hooks{
 			case appkit.KindQuotaExceeded:
 				// Kuota paket penuh: tawarkan naik paket, bukan galat isian.
 				err = apperr.QuotaExceeded(e.Message)
+			case appkit.KindIdempotencyConflict:
+				err = apperr.IdempotencyKeyConflict(e.Message)
 			}
 		}
 		httpx.WriteError(w, r, logger, err)
@@ -134,7 +140,7 @@ Relatif terhadap akar API produk (`/v1`), di balik sesi:
 | `DELETE` | `/business-profile/logo` | `settings.business.manage` | hapus logo |
 | `GET` | `/website` | sesi apa pun | pengaturan halaman depan; bawaannya hanya pintu masuk |
 | `PUT` | `/website` | `settings.website.manage` | simpan SELURUH isian |
-| `PUT` | `/website/images/{slot}` | `settings.website.manage` | body: isi gambar; slot `about` atau `seo` |
+| `PUT` | `/website/images/{slot}` | `settings.website.manage` | body: isi gambar; slot `seo` |
 | `DELETE` | `/website/images/{slot}` | `settings.website.manage` | hapus gambar |
 | `GET` | `/regions?parent=<kode>` | sesi apa pun | anak langsung; tanpa `parent`: provinsi |
 | `GET` | `/regions/search?q=&limit=` | sesi apa pun | cari kabupaten/kota, kecamatan, desa |
@@ -142,7 +148,12 @@ Relatif terhadap akar API produk (`/v1`), di balik sesi:
 | `POST` | `/roles` | `settings.roles.manage` | buat role buatan; menjawab `201` |
 | `PUT` | `/roles/{key}` | `settings.roles.manage` | simpan SELURUH isian role buatan |
 | `DELETE` | `/roles/{key}` | `settings.roles.manage` | hapus role buatan; menjawab `204` |
+| `GET` | `/users` | `settings.users.manage` | pengguna, batas pengguna, kesiapan pemberian akses, dan role |
+| `POST` | `/users` | `settings.users.manage` | beri akses lewat email; menjawab `201` |
+| `PATCH` | `/users/{id}` | `settings.users.manage` | ubah role atau status |
 | `GET` | `/audit-events?category=&before=&limit=` | `settings.audit.view` | jejak audit, terbaru dulu |
+| `GET` | `/document-numbering` | `settings.numbering.manage` | skema penomoran tiap jenis dokumen, dan daftar token |
+| `PUT` | `/document-numbering/{type}` | `settings.numbering.manage` | simpan pola dan kebijakan reset satu jenis dokumen |
 
 Tanpa sesi, di akar situs:
 
@@ -151,8 +162,9 @@ Tanpa sesi, di akar situs:
 | `GET` | `/media/{id}` | isi berkas; boleh disimpan peramban selamanya |
 | `GET` | `/site.json` | tampilan publik halaman depan |
 
-**Simpan-bersamaan.** `PUT /business-profile`, `PUT /website`, dan
-`PUT /roles/{key}` membawa `version` yang dibaca dari `GET`. Bila datanya
+**Simpan-bersamaan.** `PUT /business-profile`, `PUT /website`,
+`PUT /roles/{key}`, dan `PUT /document-numbering/{type}` membawa `version`
+yang dibaca dari `GET`. Bila datanya
 sudah diubah orang lain sejak itu, jawabannya galat `KindConflict` dan tidak
 ada yang tersimpan. Mengganti logo atau gambar tidak menaikkan `version`.
 
@@ -204,40 +216,45 @@ telepon sama dengan profil penagihan platform GONSU One, dan
 
 ## Website
 
-Halaman depan publik sebuah organization. Identitasnya (nama, logo, kontak,
-alamat) dibaca dari profil bisnis; yang diatur di sini hanya yang khas halaman
-depan.
+Identitas halaman depan publik sebuah organization: apakah ia punya halaman
+publik, dan bagaimana ia memperkenalkan diri. Nama, logo, kontak, dan alamat
+dibaca dari profil bisnis; yang diatur di sini hanya yang khas halaman depan.
+
+**Isi halaman bukan urusan modul ini.** Bagian "tentang", daftar layanan, dan
+susunan halaman lainnya milik penyusun halaman, yang membaca identitas di sini
+sebagai sumber datanya. Modul ini tidak menyimpan teks panjang, daftar, maupun
+gambar bagian halaman.
 
 ```json
 {
   "mode": "site",
   "tagline": "Pakaian rapi untuk setiap hari",
   "summary": "Toko pakaian keluarga di Bandung sejak 2010.",
-  "about": { "text": "…", "image": null },
-  "services": [{ "title": "Jahit ukuran", "description": "…", "icon": "wrench" }],
   "contact": { "hours": "Senin–Sabtu 09.00–17.00", "map_url": "https://…", "hide_address": false },
   "channels": { "whatsapp": "6281234567890", "instagram": "https://www.instagram.com/…", "facebook": "", "tiktok": "", "youtube": "", "linkedin": "" },
   "seo": { "title": "", "description": "", "image": null },
-  "icons": ["package", "chart", "wrench", "…"],
   "version": 2,
   "updated_at": "2026-10-02T03:04:05Z"
 }
 ```
 
-- `mode`: `"signin"` (bawaan) hanya menampilkan pintu masuk; `"site"`
-  menampilkan web perusahaan. Pada `"signin"`, tampilan publik hanya membawa
-  nama, logo, dan judul.
-- `services` maksimal 8; `icon` salah satu dari `icons`.
+- `mode` menjawab satu pertanyaan: apakah organization ini punya halaman
+  publik. `"signin"` (bawaan) hanya menampilkan pintu masuk, dan tampilan
+  publiknya hanya membawa nama, logo, dan judul. `"site"` menampilkan halaman
+  publik beserta pintu masuk. Mode menyebut apa yang didapat pengunjung, bukan
+  alat yang menyusun halamannya: halaman dari penyusun halaman tampil di mode
+  yang sama, jadi mode tidak bertambah saat penyusun halaman ada.
 - `channels.whatsapp` disimpan sebagai digit berkode negara (nomor berawalan
   `0` dianggap nomor Indonesia). Kanal lain berupa alamat `https` di situs
   kanalnya.
 - `contact.hide_address` menyembunyikan alamat jalan; kota tetap tampil.
 - `seo` yang kosong diturunkan: judul dari nama bisnis dan tagline, deskripsi
   dari ringkasan, gambar dari logo.
-- Gambar diatur lewat `PUT /website/images/{slot}`, tidak lewat `PUT /website`.
+- Gambar pratinjau diatur lewat `PUT /website/images/seo`, tidak lewat
+  `PUT /website`.
 - Isinya disimpan sebagai satu dokumen JSON, jadi isian baru tidak butuh
-  migrasi. Yang sengaja tidak ada: warna atau tema sendiri, skrip analytics,
-  dan multi-bahasa.
+  migrasi. Yang sengaja tidak ada: isi halaman, warna atau tema sendiri,
+  skrip analytics, dan multi-bahasa.
 
 **Tampilan publik** (`GET /site.json`, `Service.Public`) adalah gabungan profil
 bisnis dan pengaturan ini yang sudah disaring untuk pengunjung. NPWP, nama
@@ -261,16 +278,21 @@ Role adalah kumpulan izin bernama. Pembagiannya:
 | izin | kode produk (`roles.Options.Permissions`) | rilis produk |
 | role bawaan | kode produk (`roles.Options.Builtins`) | rilis produk |
 | role buatan | tabel `appkit_roles`, per organization | pemegang `settings.roles.manage` |
-| siapa memegang role apa | tabel pengguna milik **produk**, yang menyimpan `key` role | produk |
+| siapa memegang role apa | modul `users` (tabel `appkit_users`), yang menyimpan `key` role | pemegang `settings.users.manage` |
 
-Karena pemegang role disimpan produk, tiga hal tetap tugas produk: memeriksa
-role saat memberikannya ke pengguna, menjaga selalu ada minimal satu
-administrator aktif, dan menghitung kuota pengguna.
+`roles` sendiri tidak tahu siapa memegang role apa; ia bertanya lewat dua opsi
+yang diisi dari modul `users`. Produk yang menyimpan penggunanya sendiri
+mengisi keduanya dari tabelnya, dan menanggung sendiri tiga hal yang dijaga
+`users`: memeriksa role saat memberikannya, minimal satu administrator aktif,
+dan batas pengguna.
 
 ### Memasang
 
 ```go
-var access *roles.Service
+var (
+	access *roles.Service
+	people *users.Service // diisi di bagian Pengguna
+)
 
 hooks := appkit.Hooks{
 	Organization: tenant.OrganizationID,
@@ -314,10 +336,14 @@ access, err = roles.New(pool, trail, hooks, roles.Options{
 	CustomEnabled: func(ctx context.Context, org uuid.UUID) (bool, error) {
 		return license.Feature(ctx, entitlement.RolesCustom), nil
 	},
-	// Jumlah pengguna per key role, dari tabel pengguna produk.
-	UserCounts: users.CountByRole,
-	// Kunci yang sama dengan yang diambil produk saat memberikan role.
-	LockAssignments: users.LockGrants,
+	// Keduanya dari modul users. Penutupnya ada karena roles dan users saling
+	// membutuhkan: `people` baru terisi sesudah roles.New.
+	UserCounts: func(ctx context.Context, org uuid.UUID) (map[string]int, error) {
+		return people.CountByRole(ctx, org)
+	},
+	LockAssignments: func(ctx context.Context, tx pgx.Tx, org uuid.UUID) error {
+		return people.LockGrants(ctx, tx, org)
+	},
 })
 ```
 
@@ -383,11 +409,11 @@ func (s *Service) All(ctx context.Context, org uuid.UUID) ([]Role, error)
   Ini pengaman, bukan batas yang dijual; batasnya keras, juga untuk
   pembuatan bersamaan.
 - **Role yang masih dipegang pengguna tidak dapat dihapus**, menurut
-  `UserCounts`. Supaya menghapus dan memberikan role tidak pernah berselang,
-  isi `LockAssignments` dengan fungsi yang mengambil — di transaksi yang
-  diserahkan — kunci yang sama dengan kunci pemberian role di produk,
-  misalnya `pg_advisory_xact_lock`. Tanpanya, role yang diberikan tepat saat
-  dihapus menjadi key tanpa role, yang tidak memegang izin apa pun.
+  `UserCounts` — termasuk yang dipegang pengguna nonaktif. `LockAssignments`
+  mengambil, di transaksi penghapusannya, kunci pemberian akses, sehingga
+  menghapus dan memberikan role tidak pernah berselang. Tanpanya, role yang
+  diberikan tepat saat dihapus menjadi key tanpa role, yang tidak memegang
+  izin apa pun.
 - **Setiap perubahan dicatat di jejak audit**, di transaksi yang sama:
   `role.created`, `role.updated`, `role.deleted`, dengan isi role sebelum dan
   sesudahnya. Catatan bertahan setelah rolenya dihapus.
@@ -421,6 +447,117 @@ func (s *Service) All(ctx context.Context, org uuid.UUID) ([]Role, error)
 - `audience` kosong saat membuat berarti `internal`. Saat mengubah ia boleh
   kosong, dan bila diisi harus sama dengan audiens role itu.
 
+## Pengguna
+
+Siapa yang berhak masuk ke sebuah organization, dan dengan role apa. Pengguna
+lahir dari pemberian akses yang disengaja, tidak pernah dari login pertama:
+orang yang tidak dikenal ditolak, bukan dibuatkan akun.
+
+Yang **tidak** ada di modul ini, dan tetap milik produk: sandi (tidak ada
+kolomnya), login, sesi, dan pembuatan akun di penyedia identitas. Library ini
+tidak pernah memanggil platform; yang dibutuhkan diminta lewat `Options`.
+
+```go
+people, err = users.New(pool, access, trail, hooks, users.Options{
+	// Batas pengguna AKTIF, dari hak pakai paket.
+	Seats: func(ctx context.Context, org uuid.UUID) (int64, error) {
+		max, unlimited := license.Limit(ctx, entitlement.UsersMax)
+		if unlimited {
+			return users.Unlimited, nil
+		}
+		return max, nil
+	},
+	// Membuatkan atau menemukan akun login di penyedia identitas produk.
+	Provision: func(ctx context.Context, email, name string) (users.Identity, error) {
+		id, err := identities.Provision(ctx, email, name)
+		return users.Identity{Subject: id.Subject, Email: id.Email, Name: id.DisplayName, TemporaryPassword: id.TemporaryPassword}, err
+	},
+	Available: func(context.Context) bool { return identities.Available() },
+	// Sesi adalah tabel produk; dicabut di transaksi yang sama.
+	RevokeSessions: func(ctx context.Context, tx pgx.Tx, org, user uuid.UUID) error {
+		return sessions.RevokeAll(ctx, tx, org, user)
+	},
+})
+```
+
+Tiga jalan pemberian akses, satu aturan:
+
+| jalan | fungsi | sesi |
+|---|---|---|
+| layar Pengguna & Akses | `Invite`, `Update` (endpoint di atas) | izin `settings.users.manage` |
+| perintah operator | `Grant`, `Suspend` dengan `users.SourceOperator` | tanpa sesi |
+| pemilik organization saat masuk pertama | `Grant` dengan `users.SourceOwner` | tanpa sesi |
+
+Untuk login dan sesi produk, semuanya dengan `org` eksplisit:
+
+```go
+func (s *Service) BySubject(ctx context.Context, org uuid.UUID, subject string) (User, error)
+func (s *Service) ByID(ctx context.Context, org, id uuid.UUID) (User, error)
+func (s *Service) RecordLogin(ctx context.Context, org uuid.UUID, subject, email, name string) (User, error)
+func (s *Service) All(ctx context.Context, org uuid.UUID) ([]User, error)
+```
+
+- Kunci orangnya `subject` — pengenalnya di penyedia identitas (klaim `sub`) —
+  bukan email: email berubah, `sub` tidak.
+- `RecordLogin` hanya berhasil untuk pengguna aktif: ia memperbarui waktu
+  masuk terakhir, menyamakan email dan nama dengan penyedia identitas, dan
+  mencatat `session.signed_in` di jejak audit. Orang yang tidak dikenal atau
+  dinonaktifkan dijawab "tidak ditemukan", dan produk menolak loginnya.
+- Produk memeriksa `status` pengguna pada setiap permintaan (`ByID`, atau
+  `JOIN` ke `appkit_users` dari tabel sesinya): yang dinonaktifkan kehilangan
+  akses saat itu juga, dan role baru berlaku pada permintaan berikutnya.
+- Tabel sesi produk boleh merujuk `appkit_users (organization_id, id)`.
+
+### Pagar
+
+- **Batas pengguna ditegakkan di setiap pemberian akses**, di dalam kunci per
+  organization: dua pemberian bersamaan tidak sama-sama lolos. Yang dihitung
+  seluruh pengguna aktif. `users.Unlimited` berarti tanpa batas; **nol berarti
+  tidak boleh ada pengguna aktif baru**, bukan tanpa batas. Batas yang penuh
+  dijawab galat `KindQuotaExceeded`.
+- **Tidak ada yang dapat menonaktifkan dirinya sendiri.**
+- **Administrator aktif terakhir tidak dapat diturunkan atau dinonaktifkan**
+  lewat layar. Jalan operator tidak dibatasi: itu jalan pemulihan.
+- **Role yang diberikan harus ada**, dan dibaca sesudah kunci diambil, jadi
+  role yang sedang dihapus tidak dapat diberikan.
+- **Jenis orangnya tidak berubah.** Layar ini hanya memberikan role
+  `internal`; role pengganti harus seaudiens dengan role sekarang. Orang luar
+  butuh ikatan ke pihaknya (misalnya pelanggannya) yang hanya diketahui
+  produk, jadi aksesnya diberikan alur produk lewat `Grant`.
+- **Menonaktifkan mencabut sesi** di transaksi yang sama, lewat
+  `RevokeSessions`.
+- **Setiap perubahan akses dicatat di jejak audit**: `user.access_granted`,
+  `user.role_changed`, `user.suspended`, `user.reactivated`, dengan jalannya
+  (`screen`, `operator`, `owner`) di `details.source`.
+- **Sandi sementara tidak pernah disimpan atau dicatat.** Ia hanya ada di
+  jawaban `POST /users`, yang dikirim dengan `Cache-Control: no-store`. Jangan
+  lewatkan endpoint itu ke modul idempotency.
+
+### Bentuk
+
+`GET /users`:
+
+```json
+{
+  "data": [
+    { "id": "0199a4c1-…", "subject": "abc123", "email": "ani@contoh.example", "name": "Ani Wijaya", "role": "administrator", "status": "active", "last_login_at": "2026-10-03T03:04:05Z", "created_at": "2026-10-01T03:04:05Z", "is_self": true }
+  ],
+  "invite": { "available": true },
+  "seats": { "active": 1, "max": 5 },
+  "roles": [ { "key": "administrator", "name": "Administrator", "…": "…" } ]
+}
+```
+
+- `role` adalah key role; nama tampilnya dicari di `roles`, yang memuat
+  seluruh role organization itu.
+- `seats.max` `null` berarti tanpa batas. `invite.available` false disertai
+  `invite.reason`.
+- Body `POST /users`: `email`, `name`, `role`. Jawabannya `{user, account,
+  temporary_password}`; `account` bernilai `created` atau `existing`, dan
+  `temporary_password` hanya ada bila akunnya baru dibuat.
+- Body `PATCH /users/{id}`: `role` dan/atau `status` (`active`, `suspended`);
+  yang kosong tidak diubah.
+
 ## Jejak audit
 
 Siapa melakukan apa, kapan, dan dari alamat mana, per organization. Catatan
@@ -430,9 +567,9 @@ ditetapkan, jadi tidak ada penghapusan otomatis.
 
 | kelompok | isinya | siapa yang mencatat |
 |---|---|---|
-| `access` | akses diberikan atau dicabut, role pengguna diubah, role dibuat atau diubah izinnya | `roles` untuk role; produk untuk pengguna |
+| `access` | akses diberikan atau dicabut, role pengguna diubah, role dibuat atau diubah izinnya | `users`, `roles` |
 | `settings` | profil bisnis, website, pengaturan lain | `businessprofile`, `website`; produk untuk pengaturannya sendiri |
-| `session` | masuk, keluar, sesi yang diputus | produk |
+| `session` | masuk, keluar, sesi yang diputus | `users.RecordLogin` untuk masuk; produk untuk keluar dan sesi yang diputus |
 | `activity` | tindakan penting milik produk: menyetujui dokumen, menghapus, mengubah harga | produk |
 
 Yang **tidak** dicatat: pembacaan data, dan isi yang rahasia. Untuk sebuah
@@ -448,6 +585,10 @@ Modul library mencatat sendiri, di transaksi yang sama dengan perubahannya:
 | `website.updated` | `fields`: isian yang berubah |
 | `website.image_changed`, `website.image_removed` | `slot` |
 | `role.created`, `role.updated`, `role.deleted` | `before`, `after`: isi role |
+| `numbering.scheme_updated` | `fields`: isian yang berubah |
+| `user.access_granted`, `user.suspended` | `role`, `source` |
+| `user.role_changed`, `user.reactivated` | `role_before`, `role_after`, `source` |
+| `session.signed_in` | — |
 
 Produk mencatat miliknya:
 
@@ -468,6 +609,7 @@ err = trail.RecordFor(ctx, org, userID, audit.Entry{
 })
 ```
 
+- `RecordForTx` adalah `RecordFor` di dalam transaksi pemanggil.
 - `Record` dan `RecordTx` membaca organization dan pelaku dari pengait;
   keduanya tidak memeriksa izin, karena yang dicatat adalah tindakan yang
   sudah diizinkan pemanggilnya.
@@ -506,6 +648,184 @@ err = trail.RecordFor(ctx, org, userID, audit.Entry{
   di halaman terakhir.
 - `actor_id` adalah id pengguna di dalam produk; `null` bila bukan tindakan
   seorang pengguna. Nama pelakunya dicari produk dari id itu.
+
+## Idempotency
+
+Mutasi yang diulang klien — karena timeout, koneksi putus, atau tombol ditekan
+dua kali — tidak boleh menghasilkan dokumen ganda. Modul ini tidak punya
+endpoint; modul produk yang membuat dokumen memakainya di dalam transaksinya:
+
+```go
+idem, err := idempotency.New(pool, idempotency.Options{}) // TTL bawaan 24 jam
+
+// Di handler: key dari header, sidik jari dari body.
+key, err := idempotency.Key(r)
+fingerprint := idempotency.Fingerprint(body)
+
+// Di service:
+scope := idempotency.Scope{OrganizationID: org, Endpoint: "POST /v1/invoices", Key: key, Fingerprint: fingerprint}
+if resp, err := idem.Replay(ctx, scope); err != nil || resp != nil {
+	return resp, err // sudah pernah: putar ulang response-nya byte per byte
+}
+tx, err := pool.Begin(ctx)
+defer func() { _ = tx.Rollback(ctx) }()
+claimed, err := idem.Claim(ctx, tx, scope)
+if !claimed {
+	// Permintaan lain meng-commit key yang sama lebih dulu.
+	_ = tx.Rollback(ctx)
+	if resp, err := idem.Replay(ctx, scope); err != nil || resp != nil {
+		return resp, err
+	}
+	return nil, appkit.IdempotencyConflict("Permintaan dengan kunci yang sama sedang diproses.")
+}
+// … membuat dokumen di tx, menyusun body response …
+resp := idempotency.Response{Status: http.StatusCreated, Body: body}
+if err := idem.Complete(ctx, tx, scope, resp); err != nil {
+	return nil, err
+}
+return &resp, tx.Commit(ctx)
+```
+
+- Klaim, dokumen, dan response-nya di-commit bersama, jadi tidak ada keadaan
+  "dokumen sudah ada tetapi key belum tercatat". Transaksi yang dibatalkan
+  melepas klaimnya.
+- Key berlaku per organization dan per `Endpoint`, selama `Options.TTL`. Key
+  yang sama dengan isi berbeda dijawab galat jenis
+  `appkit.KindIdempotencyConflict`; petakan di `Hooks.WriteError` produk.
+- Header `Idempotency-Key` berisi 8–200 karakter huruf, angka, atau `. _ : -`.
+- **Response yang membawa rahasia tidak boleh lewat modul ini** — misalnya
+  jawaban `POST /users` yang membawa sandi sementara: response yang tersimpan
+  ikut tersimpan di database selama key-nya hidup.
+- Library ini tidak menjalankan pekerjaan latar. Produk memanggil
+  `idem.DeleteExpired(ctx)` secara berkala untuk membuang baris kedaluwarsa.
+
+## Penomoran dokumen
+
+Nomor untuk dokumen apa pun milik produk: order, faktur, surat jalan. Jenis
+dokumen didaftarkan produk di kode, jadi menambah jenis tidak menuntut
+migrasi; bentuk nomornya milik organization, dan administratornya dapat
+menggantinya dari layar pengaturan.
+
+```go
+numbers, err := numbering.New(pool, trail, hooks, numbering.Options{
+	Types: []numbering.Type{
+		{Key: "invoice", Label: "Faktur", Pattern: "INV/{YYYY}/{SEQ:05}", Reset: numbering.ResetYearly},
+		{Key: "delivery", Label: "Surat Jalan", Pattern: "SJ/{YYYYMM}/{SEQ:04}", Reset: numbering.ResetMonthly},
+	},
+	// Zona waktu organization menurut produk: tahun dan bulan pada nomor
+	// mengikuti waktu setempat, bukan UTC. Kosong: Asia/Jakarta untuk semua.
+	Timezone: tenant.Timezone,
+})
+
+// Di dalam transaksi dokumennya:
+number, err := numbers.Next(ctx, tx, org, "invoice", time.Now())
+```
+
+- **Tanpa nomor kembar dan tanpa nomor lompat**, juga saat dua dokumen
+  disimpan bersamaan. `Next` wajib dipanggil di dalam transaksi dokumennya:
+  dokumen yang batal disimpan mengembalikan nomornya, dan dokumen berikutnya
+  memakainya.
+- **Harganya:** dua pengguna yang membuat jenis dokumen yang sama di
+  organization yang sama bergiliran sampai transaksi yang pertama selesai.
+  Karena itu transaksi dokumen harus singkat, dan `Options.Timezone` — yang
+  dipanggil selagi transaksinya terbuka — harus menjawab dari memori.
+  Transaksi yang menomori beberapa jenis dokumen mengambilnya dalam urutan
+  yang tetap.
+- **Token pola:** `{YYYY}`, `{YY}`, `{YYYYMM}`, `{MM}`, `{SEQ}`, dan `{SEQ:NN}`
+  untuk nomor berangka nol di depan. Pola wajib memuat `{SEQ}`, paling panjang
+  60 karakter.
+- **Kapan nomor kembali ke 1:** `never`, `yearly`, atau `monthly`. Pola dengan
+  reset tahunan wajib memuat tahun, dan reset bulanan wajib memuat tahun dan
+  bulan; tanpa itu nomor urut kembali ke 1 sedangkan nomor yang tercetak
+  tidak berubah, dan dua dokumen mendapat nomor yang sama.
+- **Mengubah pola tidak menyentuh nomor urut**: nomor yang sudah terbit tidak
+  berubah diam-diam. Mengubah kebijakan reset membawa nomor urut yang sedang
+  berjalan ke lingkup barunya, supaya nomor yang sama tidak terbit dua kali.
+- Baris skema hanya ada bila organization mengganti bawaannya, jadi
+  organization baru tidak perlu disiapkan. Perubahan skema dicatat di jejak
+  audit sebagai `numbering.scheme_updated`.
+- Pagar terakhir tetap di produk: beri indeks unik pada nomor dokumennya per
+  organization. Dokumen bertanggal mundur ke periode yang dinomori dengan
+  kebijakan lama masih dapat bertabrakan.
+
+`GET /document-numbering`:
+
+```json
+{
+  "data": [
+    { "document_type": "invoice", "label": "Faktur", "pattern": "INV/{YYYY}/{SEQ:05}", "reset_policy": "yearly", "custom": false, "next_number": "INV/2026/00042", "version": 0, "updated_at": null }
+  ],
+  "tokens": [ { "token": "{YYYY}", "meaning": "tahun empat angka, mis. 2026" } ]
+}
+```
+
+- `next_number` adalah contoh nomor berikutnya, dihitung tanpa
+  mengalokasikannya. `custom` false berarti bawaan dari kode yang berlaku.
+- Body `PUT /document-numbering/{type}`: `pattern`, `reset_policy`, `version`.
+
+## Lampiran privat
+
+Berkas yang hanya boleh dilihat orang yang berhak: lampiran surat perintah
+kerja, pindaian kontrak, foto pemeriksaan mutu. Ini pasangan privat `media`:
+berkas yang tampil tanpa sesi tempatnya di `media`, berkas yang butuh izin
+tempatnya di sini.
+
+Modul ini **tidak punya endpoint dan tidak punya jalur baca publik**. Siapa
+yang boleh membaca atau mengunggah lampiran yang mana diputuskan modul produk
+pemilik dokumennya: ia memeriksa izin atas dokumen itu, lalu memanggil modul
+ini dengan dokumen yang sama sebagai pemilik.
+
+```go
+var files *attachments.Service
+
+images, err := media.New(pool, hooks, media.Options{
+	Quota: storageQuota,
+	// Kuota penyimpanan satu, dipakai berdua: media menghitung lampiran...
+	OtherUsage: func(ctx context.Context, org uuid.UUID) (int64, error) {
+		u, err := files.Usage(ctx, org)
+		return u.Bytes, err
+	},
+})
+files, err = attachments.New(pool, attachments.Options{
+	Store: store, // penyimpanan yang sama dengan media; kosong: database
+	Quota: storageQuota,
+	// ...dan lampiran menghitung media.
+	OtherUsage: func(ctx context.Context, org uuid.UUID) (int64, error) {
+		u, err := images.Usage(ctx, org)
+		return u.Bytes, err
+	},
+})
+
+// Di handler produk, SETELAH izin atas dokumen orderID diperiksa:
+owner := attachments.Owner{Type: "work_order", ID: orderID}
+f, err := files.Save(ctx, org, owner, header.Filename, userID, body)
+
+f, content, err := files.Open(ctx, org, owner, fileID)
+defer content.Close()
+attachments.Serve(w, r, f, content)
+```
+
+- **Berkas hanya terbaca dan terhapus lewat dokumen pemiliknya.** `Get`,
+  `Open`, dan `Delete` meminta `Owner`; berkas dokumen lain — walau satu
+  organization — dijawab "tidak ditemukan". Izin atas satu dokumen tidak
+  pernah membuka lampiran dokumen lain, dan id berkas dari URL tidak perlu
+  diperiksa lagi.
+- Setiap baca dan hapus menyaring organization, tanpa pengecualian.
+- **Jenis berkas dikenali dari isinya**, bukan dari nama atau header klien.
+  Bawaannya PDF, PNG, JPEG, dan WebP (`Options.Types`). SVG dan HTML tidak
+  pernah diterima, apa pun pengaturannya. Berkas Office (`.docx`, `.xlsx`)
+  terbaca sebagai `application/zip`.
+- **Selalu disajikan sebagai unduhan** (`Serve`): `Content-Disposition:
+  attachment`, `Cache-Control: private, no-store`, tidak pernah ditampilkan
+  di dalam halaman.
+- Batas ukuran satu berkas bawaannya 10 MB (`Options.MaxBytes`).
+- Isinya disimpan lewat `media.Store` di bawah key berawalan `private/`, jadi
+  tidak bertabrakan dengan berkas media walau penyimpanannya sama.
+- `files.DeleteOwner(ctx, org, owner)` menghapus seluruh lampiran satu
+  dokumen, untuk dipanggil saat dokumennya dihapus.
+- Modul ini tidak mencatat ke jejak audit: yang mencatat unggahan dan
+  penghapusan lampiran adalah modul pemilik dokumennya, seperti logo dicatat
+  `businessprofile`.
 
 ## Media
 
@@ -582,6 +902,8 @@ files, err := media.New(pool, hooks, media.Options{
   mengganti gambarnya. Modul lain memakai `files.SaveReplacing` untuk itu.
 - `files.Usage(ctx, org)` menjawab pemakaian sekarang (byte dan jumlah
   berkas), untuk ditampilkan produk.
+- `media.Options.OtherUsage` menambahkan pemakaian di tempat lain — biasanya
+  lampiran privat — ke hitungan kuota yang sama; lihat Lampiran privat.
 - Batasnya lunak: dua unggahan bersamaan dapat sama-sama lolos dan
   melewatinya sebesar satu berkas.
 
@@ -603,15 +925,33 @@ Aturan kontribusi ada di `AGENTS.md`.
   - Baru: modul `audit` — jejak audit per organization, hanya dapat ditambah.
   - Baru: modul `roles` — role bawaan di kode, role buatan per organization,
     dan `PermissionsOf`/`Can` untuk `Hooks.Authorize` produk.
+  - Baru: modul `users` — pengguna per organization, pemberian akses, batas
+    pengguna, dan pengaman administrator terakhir.
+  - Baru: modul `idempotency`, dan galat jenis baru
+    `appkit.KindIdempotencyConflict` — tambahkan pemetaannya di
+    `Hooks.WriteError` produk.
+  - Baru: modul `numbering` — nomor dokumen tanpa kembar dan tanpa lompat.
+  - Baru: modul `attachments` — berkas privat yang terbaca hanya lewat
+    dokumen pemiliknya.
+  - Baru: `media.Options.OtherUsage` dan `media.WithDBFallback`. Tanpa
+    `OtherUsage` perilaku kuota media tidak berubah.
   - Baru: pengait `Hooks.User`, id pengguna di dalam produk. `Hooks.Validate`
     tidak memintanya; `audit.New` yang meminta.
+  - **Memutus:** modul `website` kini hanya menyimpan identitas halaman
+    depan. Bagian "tentang" (`about`, slot gambar `about`) dan daftar layanan
+    (`services`, `icons`) dibuang dari pengaturan dan dari tampilan publik;
+    field lamanya di `PUT /website` kini ditolak. Migrasi `00011` membuang
+    kolom gambar "tentang" beserta berkasnya.
   - **Memutus:** `businessprofile.New` dan `website.New` kini menerima service
     jejak audit (`businessprofile.New(pool, files, trail, hooks)`,
     `website.New(pool, profiles, files, trail, hooks, opts)`), dan setiap
     perubahan profil bisnis serta website dicatat. Permintaan yang mengubah
     keduanya kini butuh `Hooks.User`: tanpa pelaku, perubahannya ditolak.
-  - Migrasi baru: `00005` (`appkit_audit_events`) dan `00006`
-    (`appkit_roles`).
+  - Migrasi baru: `00005` (`appkit_audit_events`), `00006` (`appkit_roles`),
+    `00007` (`appkit_users`), `00008` (`appkit_idempotency_keys`), `00009`
+    (`appkit_number_schemes`, `appkit_number_counters`), `00010`
+    (`appkit_attachments`), dan `00011` (lihat di atas). Tabelnya terpasang di
+    setiap produk, dipakai atau tidak.
 - **v0.3.0**
   - Baru: `media/s3store` — isi berkas di object storage yang berbicara API
     S3 (Cloudflare R2, AWS S3). Berkas lama di database tetap terbaca.

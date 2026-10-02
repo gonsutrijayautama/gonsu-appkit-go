@@ -1,10 +1,16 @@
-// Package website mengatur halaman depan publik sebuah organization: web
-// perusahaan singkat di alamat aplikasinya, atau hanya pintu masuk.
+// Package website mengatur IDENTITAS halaman depan publik sebuah organization:
+// apakah ia punya halaman publik atau hanya pintu masuk, dan bagaimana ia
+// memperkenalkan diri.
 //
-// Identitas — nama, logo, kontak, alamat — tidak diisi di sini, melainkan
-// dibaca dari profil bisnis (package businessprofile). Yang diatur di sini
-// adalah yang khas halaman depan: tagline, cerita, layanan, jam kerja, kanal,
-// dan bagaimana tautannya tampil saat dibagikan.
+// Nama, logo, kontak, dan alamat tidak diisi di sini, melainkan dibaca dari
+// profil bisnis (package businessprofile). Yang diatur di sini adalah yang
+// khas halaman depan: tagline, ringkasan, jam kerja, kanal, dan bagaimana
+// tautannya tampil saat dibagikan.
+//
+// ISI halaman — bagian "tentang", daftar layanan, dan susunan lainnya — bukan
+// urusan package ini. Itu milik penyusun halaman, yang membaca identitas di
+// sini sebagai sumber datanya. Karena itu package ini tidak menyimpan teks
+// panjang, daftar, maupun gambar bagian halaman.
 //
 // Dua sisi:
 //
@@ -27,7 +33,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"slices"
 	"sync"
 	"time"
 
@@ -49,7 +54,9 @@ const (
 	// ModeSignIn: hanya pintu masuk aplikasi. Bawaan, dan pilihan organization
 	// yang tidak ingin punya web publik: isi lain tidak disajikan sama sekali.
 	ModeSignIn = "signin"
-	// ModeSite: web perusahaan — tentang, layanan, kontak — beserta pintu masuk.
+	// ModeSite: ada halaman publik, beserta pintu masuk. Mode menyebut apa yang
+	// didapat pengunjung, bukan alat yang menyusun halamannya: halaman dari
+	// penyusun halaman tampil di mode yang sama.
 	ModeSite = "site"
 )
 
@@ -131,8 +138,6 @@ func New(pool *pgxpool.Pool, profiles *businessprofile.Service, m *media.Service
 // Settings adalah pengaturan website di API bersesi.
 type Settings struct {
 	Document
-	// Icons adalah nama ikon yang boleh dipakai sebuah layanan.
-	Icons []string `json:"icons"`
 	// Version dikirim balik saat menyimpan (Input.Version): simpan yang
 	// membawa version lama ditolak. 0 bila belum pernah disimpan.
 	Version int `json:"version"`
@@ -146,28 +151,11 @@ type Document struct {
 	// Mode: ModeSignIn atau ModeSite.
 	Mode    string `json:"mode"`
 	Tagline string `json:"tagline"`
-	// Summary: satu-dua kalimat tentang bisnisnya, di atas daftar layanan.
+	// Summary: satu-dua kalimat tentang bisnisnya.
 	Summary  string   `json:"summary"`
-	About    About    `json:"about"`
-	Services []Item   `json:"services"`
 	Contact  Contact  `json:"contact"`
 	Channels Channels `json:"channels"`
 	SEO      SEO      `json:"seo"`
-}
-
-// About adalah bagian "Tentang kami".
-type About struct {
-	Text string `json:"text"`
-	// Image diatur lewat PUT /website/images/about, bukan lewat simpan.
-	Image *media.File `json:"image"`
-}
-
-// Item adalah satu layanan.
-type Item struct {
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	// Icon adalah salah satu dari Icons.
-	Icon string `json:"icon"`
 }
 
 // Contact melengkapi kontak dari profil bisnis.
@@ -204,7 +192,11 @@ type SEO struct {
 
 // documentSchema adalah nomor bentuk dokumen yang disimpan. Isian baru yang
 // hanya menambah tidak menaikkannya.
-const documentSchema = 1
+//
+// Dokumen bernomor 1 masih dapat membawa about_text dan services, dari masa
+// package ini ikut menyimpan isi halaman. Keduanya diabaikan saat dibaca dan
+// hilang pada simpan berikutnya.
+const documentSchema = 2
 
 // stored adalah dokumen seperti tersimpan di kolom settings: hanya teks.
 // Gambar tidak pernah masuk dokumen; ia kolom tersendiri.
@@ -213,8 +205,6 @@ type stored struct {
 	Mode           string   `json:"mode"`
 	Tagline        string   `json:"tagline"`
 	Summary        string   `json:"summary"`
-	AboutText      string   `json:"about_text"`
-	Services       []Item   `json:"services"`
 	Contact        Contact  `json:"contact"`
 	Channels       Channels `json:"channels"`
 	SEOTitle       string   `json:"seo_title"`
@@ -235,8 +225,6 @@ func (d stored) changed(old stored) []string {
 		{"mode", d.Mode != old.Mode},
 		{"tagline", d.Tagline != old.Tagline},
 		{"summary", d.Summary != old.Summary},
-		{"about.text", d.AboutText != old.AboutText},
-		{"services", !slices.Equal(d.Services, old.Services)},
 		{"contact", d.Contact != old.Contact},
 		{"channels", d.Channels != old.Channels},
 		{"seo.title", d.SEOTitle != old.SEOTitle},
@@ -252,7 +240,6 @@ func (d stored) changed(old stored) []string {
 func (d stored) document() Document {
 	doc := Document{
 		Mode: d.Mode, Tagline: d.Tagline, Summary: d.Summary,
-		About: About{Text: d.AboutText}, Services: d.Services,
 		Contact: d.Contact, Channels: d.Channels,
 		SEO: SEO{Title: d.SEOTitle, Description: d.SEODescription},
 	}
@@ -275,15 +262,15 @@ func (s *Service) Get(ctx context.Context) (Settings, error) {
 
 func (s *Service) lookup(ctx context.Context, org uuid.UUID) (Settings, error) {
 	var (
-		raw        []byte
-		about, seo *uuid.UUID
-		at         time.Time
-		out        = Settings{Icons: Icons}
+		raw []byte
+		seo *uuid.UUID
+		at  time.Time
+		out Settings
 	)
 	err := s.pool.QueryRow(ctx, `
-		SELECT settings, about_media_id, seo_media_id, version, updated_at
+		SELECT settings, seo_media_id, version, updated_at
 		FROM appkit_websites
-		WHERE organization_id = $1`, org).Scan(&raw, &about, &seo, &out.Version, &at)
+		WHERE organization_id = $1`, org).Scan(&raw, &seo, &out.Version, &at)
 	if errors.Is(err, pgx.ErrNoRows) {
 		out.Document = defaults()
 		return out, nil
@@ -297,18 +284,12 @@ func (s *Service) lookup(ctx context.Context, org uuid.UUID) (Settings, error) {
 	}
 	out.Document = doc.document()
 	out.UpdatedAt = &at
-	for _, image := range []struct {
-		id     *uuid.UUID
-		target **media.File
-	}{{about, &out.About.Image}, {seo, &out.SEO.Image}} {
-		if image.id == nil {
-			continue
-		}
-		f, err := s.media.Get(ctx, org, *image.id)
+	if seo != nil {
+		f, err := s.media.Get(ctx, org, *seo)
 		if err != nil {
 			return Settings{}, fmt.Errorf("website: membaca gambar: %w", err)
 		}
-		*image.target = &f
+		out.SEO.Image = &f
 	}
 	return out, nil
 }
@@ -320,13 +301,10 @@ func defaults() Document {
 }
 
 // fill mengisi yang kosong dengan bawaannya, supaya bentuk JSON-nya tetap:
-// mode selalu terisi dan services selalu berupa daftar.
+// mode selalu terisi.
 func fill(d *Document) {
 	if d.Mode == "" {
 		d.Mode = ModeSignIn
-	}
-	if d.Services == nil {
-		d.Services = []Item{}
 	}
 }
 
@@ -413,23 +391,17 @@ func (s *Service) Update(ctx context.Context, in Input) (Settings, error) {
 	return s.lookup(ctx, org)
 }
 
-// Slot adalah tempat gambar di pengaturan website.
+// Slot adalah tempat gambar di pengaturan website. Sekarang hanya satu;
+// gambar bagian halaman bukan identitas, dan tempatnya di penyusun halaman.
 type Slot string
 
-const (
-	// SlotAbout: foto di bagian "Tentang kami".
-	SlotAbout Slot = "about"
-	// SlotSEO: gambar pratinjau saat tautan dibagikan.
-	SlotSEO Slot = "seo"
-)
+// SlotSEO: gambar pratinjau saat tautan dibagikan.
+const SlotSEO Slot = "seo"
 
 // column adalah kolom yang menyimpan gambar slot ini. Nilainya dari daftar
 // tetap di bawah, tidak pernah dari request.
 func (slot Slot) column() (string, bool) {
-	switch slot {
-	case SlotAbout:
-		return "about_media_id", true
-	case SlotSEO:
+	if slot == SlotSEO {
 		return "seo_media_id", true
 	}
 	return "", false

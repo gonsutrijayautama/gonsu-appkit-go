@@ -17,6 +17,12 @@ const (
 	// misalnya kuota penyimpanan paketnya. Produk memetakannya ke tawaran naik
 	// paket, bukan ke galat isian.
 	KindQuotaExceeded Kind = "quota_exceeded"
+	// KindIdempotencyConflict: Idempotency-Key ini sudah dipakai untuk
+	// permintaan dengan isi berbeda, atau permintaan pertama dengan key ini
+	// masih diproses. Client TIDAK boleh mengulang begitu saja dengan body yang
+	// diubah: permintaan yang sama diulang dengan key dan body yang sama,
+	// permintaan baru memakai key baru.
+	KindIdempotencyConflict Kind = "idempotency_conflict"
 )
 
 // FieldError menunjuk satu field yang tidak sah. Field memakai nama yang sama
@@ -53,4 +59,10 @@ func Conflict(message string) *Error {
 // QuotaExceeded mengembalikan galat "batas pemakaian penuh".
 func QuotaExceeded(message string) *Error {
 	return &Error{Kind: KindQuotaExceeded, Message: message}
+}
+
+// IdempotencyConflict mengembalikan galat "Idempotency-Key sudah dipakai
+// untuk permintaan lain, atau permintaannya masih diproses".
+func IdempotencyConflict(message string) *Error {
+	return &Error{Kind: KindIdempotencyConflict, Message: message}
 }
