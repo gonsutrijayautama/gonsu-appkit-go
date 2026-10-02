@@ -365,10 +365,18 @@ func (s *Service) SetImage(ctx context.Context, slot Slot, r io.Reader) (Setting
 	if err != nil {
 		return Settings{}, err
 	}
-	if _, ok := slot.column(); !ok {
+	column, ok := slot.column()
+	if !ok {
 		return Settings{}, errNoSlot
 	}
-	f, err := s.media.Save(ctx, org, r)
+	// Gambar yang sekarang akan dihapus swapImage, jadi tidak dihitung ke kuota.
+	var current *uuid.UUID
+	err = s.pool.QueryRow(ctx, `
+		SELECT `+column+` FROM appkit_websites WHERE organization_id = $1`, org).Scan(&current)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return Settings{}, fmt.Errorf("website: membaca gambar: %w", err)
+	}
+	f, err := s.media.SaveReplacing(ctx, org, r, current)
 	if err != nil {
 		return Settings{}, err
 	}

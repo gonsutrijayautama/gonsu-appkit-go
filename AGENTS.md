@@ -1,6 +1,7 @@
 # AGENTS.md — gonsu-appkit-go
 
-Library modul standar produk GONSU: `businessprofile`, `media`, `regions`.
+Library modul standar produk GONSU: `businessprofile`, `website`, `media`
+(dengan `media/s3store`), dan `regions`.
 Dipasang produk lewat `go get`; project hasil `gonsu new` memakainya.
 Repository ini PUBLIK supaya `go get` berjalan tanpa kredensial, tetapi
 lisensinya proprietary (lihat `LICENSE`).
@@ -32,9 +33,11 @@ lisensinya proprietary (lihat `LICENSE`).
   yang memutus dicatat di `README.md` bagian Perubahan. Sejak v1.0.0 kontrak
   hanya boleh BERTAMBAH: path `/v1`, field JSON, kolom, dan tanda tangan
   fungsi publik tidak dihapus atau diubah maknanya.
-- **Test wajib**, terhadap PostgreSQL nyata (`make test`). Setiap modul
-  menguji jalur tanpa izin dan jalur lintas organization, bukan hanya jalur
-  berhasil.
+- **Test wajib**, terhadap PostgreSQL dan layanan S3 nyata (`make test`).
+  Setiap modul menguji jalur tanpa izin dan jalur lintas organization, bukan
+  hanya jalur berhasil.
+- **Tanpa kode khusus satu penyedia penyimpanan.** `media/s3store` berbicara
+  API S3 umum; yang membedakan R2, AWS, dan lainnya hanya `Options`.
 - **CI hanya memakai runner GitHub**, tidak pernah self-hosted.
 - **Dokumen ikut kode**, di PR yang sama: `README.md` untuk cara memasang dan
   daftar endpoint.

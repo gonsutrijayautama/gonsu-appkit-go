@@ -99,7 +99,8 @@ var ErrNoSession = errors.New("produk: tanpa sesi")
 
 // Hooks mengembalikan pengait yang membaca Session dari context dan menulis
 // galat seperti produk: *appkit.Error menurut jenisnya, ErrDenied 403,
-// ErrNoSession 401, sisanya 500.
+// ErrNoSession 401, sisanya 500. Status untuk tiap jenis adalah pilihan
+// "produk" ini; library tidak menetapkannya.
 func Hooks() appkit.Hooks {
 	return appkit.Hooks{
 		Organization: func(ctx context.Context) (uuid.UUID, error) {
@@ -130,6 +131,8 @@ func Hooks() appkit.Hooks {
 					status = http.StatusNotFound
 				case appkit.KindConflict:
 					status = http.StatusConflict
+				case appkit.KindQuotaExceeded:
+					status = http.StatusPaymentRequired
 				}
 			} else if errors.Is(err, ErrDenied) {
 				status, body = http.StatusForbidden, map[string]any{"message": "ditolak"}

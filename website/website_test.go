@@ -638,3 +638,52 @@ func TestNewRequiresDependencies(t *testing.T) {
 		t.Error("New tanpa PublicOrganization lolos")
 	}
 }
+
+// Kuota penyimpanan berlaku untuk gambar website seperti untuk logo: gambar
+// baru ditolak saat penuh, gambar pengganti di slot yang sama tetap masuk.
+func TestImageQuota(t *testing.T) {
+	pool := testdb.New(t)
+	img := pngBytes(t)
+	m, err := media.New(pool, testdb.Hooks(), media.Options{
+		Quota: func(context.Context, uuid.UUID) (int64, error) { return int64(len(img)), nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := businessprofile.New(pool, m, testdb.Hooks())
+	if err != nil {
+		t.Fatal(err)
+	}
+	org := uuid.New()
+	sites, err := website.New(pool, profiles, m, testdb.Hooks(), website.Options{
+		PublicOrganization: func(*http.Request) (uuid.UUID, error) { return org, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := admin(org)
+
+	s, err := sites.SetImage(ctx, website.SlotAbout, bytes.NewReader(img))
+	if err != nil {
+		t.Fatalf("SetImage: %v", err)
+	}
+	first := s.About.Image.ID
+
+	// Slot lain: berkas tambahan, kuota tidak cukup.
+	_, err = sites.SetImage(ctx, website.SlotSEO, bytes.NewReader(img))
+	if e, ok := errors.AsType[*appkit.Error](err); !ok || e.Kind != appkit.KindQuotaExceeded {
+		t.Fatalf("gambar kedua saat kuota penuh = %v, ingin galat kuota penuh", err)
+	}
+
+	// Slot yang sama: pengganti, pemakaian tidak bertambah.
+	s, err = sites.SetImage(ctx, website.SlotAbout, bytes.NewReader(img))
+	if err != nil || s.About.Image == nil || s.About.Image.ID == first {
+		t.Fatalf("mengganti gambar saat kuota penuh = %+v, %v", s.About.Image, err)
+	}
+	if s.SEO.Image != nil {
+		t.Errorf("gambar SEO terpasang oleh unggahan yang ditolak: %+v", s.SEO.Image)
+	}
+	if usage, _ := m.Usage(ctx, org); usage.Files != 1 {
+		t.Errorf("pemakaian = %+v, ingin 1 berkas", usage)
+	}
+}

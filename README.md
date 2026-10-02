@@ -9,7 +9,7 @@ disalin per produk:
 |---|---|
 | `businessprofile` | profil bisnis organization: nama, kontak, identitas legal, alamat, logo |
 | `website` | halaman depan publik: tagline, layanan, kanal, SEO — dan penyisipannya ke HTML |
-| `media` | berkas publik (logo, gambar), dengan penyimpanan yang dapat diganti |
+| `media` | berkas publik (logo, gambar): di database atau object storage S3/R2, dengan kuota per organization |
 | `regions` | wilayah Indonesia sampai desa beserta kode pos, untuk pemilih alamat |
 
 Project hasil `gonsu new` sudah memasangnya. Halaman frontend-nya ada di
@@ -73,6 +73,9 @@ hooks := appkit.Hooks{
 				err = apperr.NotFound(e.Message)
 			case appkit.KindConflict:
 				err = apperr.ConcurrentModification(e.Message)
+			case appkit.KindQuotaExceeded:
+				// Kuota paket penuh: tawarkan naik paket, bukan galat isian.
+				err = apperr.QuotaExceeded(e.Message)
 			}
 		}
 		httpx.WriteError(w, r, logger, err)
@@ -240,24 +243,102 @@ untuk `og:image` diturunkan dari permintaan, tidak disimpan.
 - Setiap berkas dapat dibaca **siapa pun** yang mengetahui URL-nya. Jangan
   simpan berkas yang butuh izin di sini.
 - Jenisnya dikenali dari isi berkas. SVG ditolak.
-- Batas ukuran bawaan 2 MB (`media.Options.MaxBytes`).
-- Isi berkas disimpan lewat antarmuka `media.Store`. Bawaannya `media.DBStore`
-  (tabel `appkit_media_blobs`), karena pemasangan cloud GONSU belum
-  menyediakan disk maupun object storage untuk produk. Akibatnya isi berkas
-  ikut masuk backup database.
-- Mengganti `Store` tidak mengubah skema, API, maupun URL berkas.
+- Batas ukuran satu berkas bawaannya 2 MB (`media.Options.MaxBytes`). Itu
+  pengaman teknis, bukan batas yang dijual.
+
+### Penyimpanan
+
+Isi berkas disimpan lewat antarmuka `media.Store`; data tentang berkasnya
+selalu di tabel `appkit_media`. Mengganti `Store` tidak mengubah skema, API,
+maupun URL berkas.
+
+| penyimpanan | isi berkas | cocok untuk |
+|---|---|---|
+| `media.DBStore` (bawaan) | tabel `appkit_media_blobs`; ikut masuk backup database | self-host, dan pemasangan tanpa object storage |
+| `s3store.Store` | bucket yang berbicara API S3: Cloudflare R2, AWS S3, dan sejenisnya | cloud |
+
+```go
+store, err := s3store.New(s3store.Options{
+	Endpoint:        endpoint,  // R2: https://<akun>.r2.cloudflarestorage.com
+	Region:          region,    // R2: "auto"
+	Bucket:          bucket,    // harus sudah ada
+	AccessKeyID:     accessKey,
+	SecretAccessKey: secretKey,
+})
+if err != nil {
+	return err
+}
+// Salah konfigurasi ketahuan saat start, bukan di unggahan pertama.
+if err := store.Check(ctx); err != nil {
+	return err
+}
+files, err := media.New(pool, hooks, media.Options{Store: store})
+```
+
+- Library tidak membaca environment; nilai `Options` diisi produk dari
+  konfigurasinya sendiri.
+- **Berpindah dari database ke S3 tidak butuh pemindahan data.** Berkas baru
+  masuk ke bucket; berkas yang isinya sudah di database tetap terbaca dan
+  tetap dapat dihapus. Arah sebaliknya tidak: berkas yang isinya di bucket
+  tidak terbaca setelah `Store` dikembalikan ke database.
+- Berkas tetap disajikan produk di `/media/{id}`; bucket-nya tidak perlu
+  dibuka untuk umum.
+- `s3store` tidak memuat kode khusus satu penyedia. Untuk layanan yang
+  memakai alamat `https://host/bucket/key`, isi `PathStyle: true`.
+
+### Kuota
+
+Yang dibatasi adalah **total** penyimpanan satu organization. Produk
+menyerahkan batasnya — biasanya dari hak pakai paket — lewat `Options.Quota`:
+
+```go
+files, err := media.New(pool, hooks, media.Options{
+	Quota: func(ctx context.Context, org uuid.UUID) (int64, error) {
+		gb, unlimited := license.Limit(ctx, entitlement.StorageGB)
+		if unlimited {
+			return media.Unlimited, nil
+		}
+		return gb << 30, nil // byte
+	},
+})
+```
+
+- `media.Unlimited` berarti tanpa batas. **Nol berarti tidak boleh menyimpan
+  sama sekali**, bukan tanpa batas — hak pakai yang tidak dibawa paket
+  dijawab nol. Tanpa `Quota`, semua organization tanpa batas.
+- Unggahan yang melewati batas ditolak dengan galat jenis
+  `appkit.KindQuotaExceeded`; petakan di `Hooks.WriteError` produk.
+- Mengganti gambar (logo, gambar website) tidak menghitung berkas yang
+  digantikannya, jadi kuota yang penuh tidak mengunci organization dari
+  mengganti gambarnya. Modul lain memakai `files.SaveReplacing` untuk itu.
+- `files.Usage(ctx, org)` menjawab pemakaian sekarang (byte dan jumlah
+  berkas), untuk ditampilkan produk.
+- Batasnya lunak: dua unggahan bersamaan dapat sama-sama lolos dan
+  melewatinya sebesar satu berkas.
 
 ## Mengembangkan library ini
 
 ```
-make test   # seluruh test terhadap PostgreSQL lokal (docker compose)
+make test   # seluruh test terhadap PostgreSQL dan S3 lokal (docker compose)
 make lint   # go vet dan gofmt
 ```
+
+Layanan S3 lokalnya S3Proxy: ia memeriksa tanda tangan permintaan seperti
+penyedia sungguhan. Library ini belum diuji terhadap akun R2 nyata.
 
 Aturan kontribusi ada di `AGENTS.md`.
 
 ## Perubahan
 
+- **v0.3.0**
+  - Baru: `media/s3store` — isi berkas di object storage yang berbicara API
+    S3 (Cloudflare R2, AWS S3). Berkas lama di database tetap terbaca.
+  - Baru: kuota penyimpanan per organization (`media.Options.Quota`,
+    `media.Unlimited`), `Service.Usage`, dan `Service.SaveReplacing`.
+  - Baru: galat jenis `appkit.KindQuotaExceeded` — tambahkan pemetaannya di
+    `Hooks.WriteError` produk. Tanpa `Options.Quota` galat ini tidak pernah
+    muncul.
+  - Tidak ada migrasi baru dan tidak ada yang memutus.
 - **v0.2.0**
   - Baru: modul `website` (pengaturan, tampilan publik, `RenderHome`).
   - **Memutus:** `PUT /business-profile` kini wajib membawa `version`, dan

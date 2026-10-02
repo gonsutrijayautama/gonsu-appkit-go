@@ -13,6 +13,10 @@
 //     dari nama berkas atau header yang dikirim klien. SVG ditolak: ia
 //     dokumen yang dapat membawa skrip.
 //
+// Isi berkas disimpan di database (bawaan) atau di object storage (package
+// s3store); total pemakaian satu organization dapat dibatasi lewat
+// Options.Quota.
+//
 // Modul lain memakai Service langsung (Save, Delete); package ini sengaja
 // tidak punya endpoint unggah umum. Siapa yang boleh mengunggah apa adalah
 // keputusan modul pemilik berkasnya.
@@ -30,6 +34,7 @@ import (
 	_ "image/png"  // decoder untuk membaca ukuran gambar
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -46,14 +51,31 @@ const (
 	maxDimension = 8192
 	// PublicPath adalah awalan URL publik berkas, relatif terhadap akar situs.
 	PublicPath = "/media/"
+	// Unlimited adalah jawaban Options.Quota untuk organization tanpa batas
+	// penyimpanan.
+	Unlimited int64 = -1
 )
 
 // Options mengatur Service. Nilai kosong memakai bawaan.
 type Options struct {
 	// Store adalah penyimpanan isi berkas. Kosong: NewDBStore(pool).
+	//
+	// Penyimpanan lain (mis. s3store) boleh dipasang kapan saja: berkas yang
+	// isinya sudah telanjur di database tetap terbaca dari sana.
 	Store Store
-	// MaxBytes adalah batas ukuran satu berkas. Kosong: DefaultMaxBytes.
+	// MaxBytes adalah batas ukuran SATU berkas: pengaman teknis, bukan batas
+	// yang dijual. Kosong: DefaultMaxBytes.
 	MaxBytes int64
+	// Quota mengembalikan batas TOTAL penyimpanan org dalam byte — biasanya
+	// nilai hak pakai paketnya. Kosong: tanpa batas untuk semua.
+	//
+	// Unlimited (atau nilai negatif apa pun) berarti tanpa batas. NOL berarti
+	// tidak boleh menyimpan sama sekali, BUKAN tanpa batas: hak pakai yang
+	// tidak dibawa paket dijawab nol, dan itu tidak boleh membuka penyimpanan.
+	//
+	// Batasnya lunak: dua unggahan yang tiba bersamaan dapat sama-sama lolos
+	// dan melewatinya sebesar satu berkas.
+	Quota func(ctx context.Context, org uuid.UUID) (limit int64, err error)
 }
 
 // Service mengelola berkas media.
@@ -61,6 +83,7 @@ type Service struct {
 	pool       *pgxpool.Pool
 	store      Store
 	maxBytes   int64
+	quota      func(ctx context.Context, org uuid.UUID) (int64, error)
 	writeError func(w http.ResponseWriter, r *http.Request, err error)
 }
 
@@ -73,13 +96,20 @@ func New(pool *pgxpool.Pool, hooks appkit.Hooks, opts Options) (*Service, error)
 	if err := hooks.Validate(); err != nil {
 		return nil, err
 	}
-	if opts.Store == nil {
-		opts.Store = NewDBStore(pool)
+	store := opts.Store
+	switch store.(type) {
+	case nil:
+		store = NewDBStore(pool)
+	case *DBStore:
+	default:
+		// Produk yang berpindah dari database ke penyimpanan lain tidak
+		// kehilangan berkas lamanya.
+		store = withFallback{primary: store, fallback: NewDBStore(pool)}
 	}
 	if opts.MaxBytes <= 0 {
 		opts.MaxBytes = DefaultMaxBytes
 	}
-	return &Service{pool: pool, store: opts.Store, maxBytes: opts.MaxBytes, writeError: hooks.WriteError}, nil
+	return &Service{pool: pool, store: store, maxBytes: opts.MaxBytes, quota: opts.Quota, writeError: hooks.WriteError}, nil
 }
 
 // File adalah satu berkas media di API.
@@ -112,7 +142,24 @@ func key(org, id uuid.UUID) string { return org.String() + "/" + id.String() }
 
 // Save memeriksa lalu menyimpan satu gambar milik org. Pemanggil yang
 // memutuskan siapa yang boleh mengunggah; Save tidak memeriksa izin.
+//
+// Bila kuota org tidak cukup, galatnya berjenis appkit.KindQuotaExceeded.
 func (s *Service) Save(ctx context.Context, org uuid.UUID, r io.Reader) (File, error) {
+	return s.save(ctx, org, r, nil)
+}
+
+// SaveReplacing sama dengan Save, untuk berkas yang MENGGANTIKAN berkas
+// replaces (nil: tidak ada yang digantikan). Ukuran berkas lama itu tidak
+// dihitung ke kuota, supaya organization yang kuotanya penuh tetap dapat
+// mengganti gambarnya dengan yang tidak lebih besar.
+//
+// SaveReplacing tidak menghapus berkas lama; pemanggil menghapusnya setelah
+// berkas baru terpasang.
+func (s *Service) SaveReplacing(ctx context.Context, org uuid.UUID, r io.Reader, replaces *uuid.UUID) (File, error) {
+	return s.save(ctx, org, r, replaces)
+}
+
+func (s *Service) save(ctx context.Context, org uuid.UUID, r io.Reader, replaces *uuid.UUID) (File, error) {
 	if org == uuid.Nil {
 		return File{}, errors.New("media: organization kosong")
 	}
@@ -148,6 +195,9 @@ func (s *Service) Save(ctx context.Context, org uuid.UUID, r io.Reader) (File, e
 	default:
 		return File{}, appkit.Validation("Berkas harus berupa gambar PNG, JPEG, atau WebP.")
 	}
+	if err := s.checkQuota(ctx, org, f.Size, replaces); err != nil {
+		return File{}, err
+	}
 	sum := sha256.Sum256(data)
 	f.sha256 = hex.EncodeToString(sum[:])
 	f.URL = URL(f.ID)
@@ -170,15 +220,80 @@ func (s *Service) Save(ctx context.Context, org uuid.UUID, r io.Reader) (File, e
 	return f, nil
 }
 
+// Usage adalah pemakaian penyimpanan sebuah organization.
+type Usage struct {
+	// Bytes adalah jumlah ukuran seluruh berkasnya.
+	Bytes int64 `json:"bytes"`
+	Files int   `json:"files"`
+}
+
+// Usage menjumlahkan pemakaian org dari data berkasnya. Jumlahnya sama apa
+// pun penyimpanannya, karena data tentang berkas selalu di tabel.
+func (s *Service) Usage(ctx context.Context, org uuid.UUID) (Usage, error) {
+	var u Usage
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(size_bytes), 0)::bigint, COUNT(*)::int
+		FROM appkit_media WHERE organization_id = $1`, org).Scan(&u.Bytes, &u.Files)
+	if err != nil {
+		return Usage{}, fmt.Errorf("media: menghitung pemakaian: %w", err)
+	}
+	return u, nil
+}
+
+// checkQuota menolak berkas berukuran size bila kuota org tidak cukup.
+// Berkas replaces akan dihapus pemanggil, jadi ukurannya tidak dihitung.
+func (s *Service) checkQuota(ctx context.Context, org uuid.UUID, size int64, replaces *uuid.UUID) error {
+	if s.quota == nil {
+		return nil
+	}
+	limit, err := s.quota(ctx, org)
+	if err != nil {
+		return fmt.Errorf("media: membaca kuota: %w", err)
+	}
+	switch {
+	case limit < 0:
+		return nil
+	case limit == 0:
+		return appkit.QuotaExceeded("Paket Anda tidak menyertakan penyimpanan berkas.")
+	}
+	// used adalah yang ditampilkan ke pengguna; kept yang dibandingkan.
+	var used, kept int64
+	err = s.pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(size_bytes), 0)::bigint,
+		       COALESCE(SUM(size_bytes) FILTER (WHERE id IS DISTINCT FROM $2), 0)::bigint
+		FROM appkit_media WHERE organization_id = $1`, org, replaces).Scan(&used, &kept)
+	if err != nil {
+		return fmt.Errorf("media: menghitung pemakaian: %w", err)
+	}
+	if kept+size > limit {
+		return appkit.QuotaExceeded(fmt.Sprintf(
+			"Penyimpanan penuh: %s dari %s sudah terpakai. Hapus berkas yang tidak dipakai, atau naikkan paket.",
+			humanSize(used), humanSize(limit)))
+	}
+	return nil
+}
+
 func (s *Service) tooLarge() error {
 	return appkit.Validation(fmt.Sprintf("Ukuran berkas maksimal %s.", humanSize(s.maxBytes)))
 }
 
+// humanSize menulis ukuran dengan satuan yang wajar dibaca: bilangan bulat
+// bila pas, satu angka desimal bila tidak.
 func humanSize(n int64) string {
-	if n >= 1<<20 && n%(1<<20) == 0 {
-		return fmt.Sprintf("%d MB", n>>20)
+	units := []struct {
+		size int64
+		name string
+	}{{1 << 30, "GB"}, {1 << 20, "MB"}, {1 << 10, "KB"}}
+	for _, u := range units {
+		if n < u.size {
+			continue
+		}
+		if n%u.size == 0 {
+			return fmt.Sprintf("%d %s", n/u.size, u.name)
+		}
+		return strings.Replace(fmt.Sprintf("%.1f %s", float64(n)/float64(u.size), u.name), ".", ",", 1)
 	}
-	return fmt.Sprintf("%d KB", n>>10)
+	return fmt.Sprintf("%d byte", n)
 }
 
 const selectFile = `

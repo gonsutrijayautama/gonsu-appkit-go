@@ -423,3 +423,61 @@ func TestNewRequiresDependencies(t *testing.T) {
 		t.Error("New tanpa pengait lolos")
 	}
 }
+
+// Kuota penyimpanan yang penuh menolak logo baru dengan galat jenis
+// appkit.KindQuotaExceeded, tetapi tidak menghalangi MENGGANTI logo: berkas
+// lama dihapus, jadi pemakaian tidak bertambah.
+func TestLogoQuota(t *testing.T) {
+	pool := testdb.New(t)
+	logo := pngBytes(t)
+	limit := int64(len(logo))
+	m, err := media.New(pool, testdb.Hooks(), media.Options{
+		Quota: func(context.Context, uuid.UUID) (int64, error) { return limit, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := businessprofile.New(pool, m, testdb.Hooks())
+	if err != nil {
+		t.Fatal(err)
+	}
+	org := uuid.New()
+	ctx := admin(org)
+
+	p, err := profiles.SetLogo(ctx, bytes.NewReader(logo))
+	if err != nil {
+		t.Fatalf("SetLogo: %v", err)
+	}
+	first := p.Logo.ID
+
+	// Kuota tepat penuh; logo pengganti seukuran tetap masuk.
+	p, err = profiles.SetLogo(ctx, bytes.NewReader(logo))
+	if err != nil || p.Logo == nil || p.Logo.ID == first {
+		t.Fatalf("mengganti logo saat kuota penuh = %+v, %v", p.Logo, err)
+	}
+	if usage, _ := m.Usage(ctx, org); usage.Files != 1 || usage.Bytes != limit {
+		t.Errorf("pemakaian setelah mengganti logo = %+v", usage)
+	}
+
+	// Berkas lain milik organization ini memenuhi kuota: logo pengganti
+	// ditolak, dan logo yang ada tidak berubah.
+	other := []byte("RIFF\x24\x00\x00\x00WEBPVP8 ")
+	limit += int64(len(other))
+	if _, err := m.Save(ctx, org, bytes.NewReader(other)); err != nil {
+		t.Fatal(err)
+	}
+	current := p.Logo.ID
+	bigger := append(bytes.Clone(logo), make([]byte, 8)...)
+
+	mux := http.NewServeMux()
+	appkit.Register(mux, "/v1", profiles.Routes()...)
+	req := httptest.NewRequest(http.MethodPut, "/v1/business-profile/logo", bytes.NewReader(bigger)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusPaymentRequired || !strings.Contains(rec.Body.String(), `"kind":"quota_exceeded"`) {
+		t.Errorf("unggah logo melebihi kuota = %d, %s", rec.Code, rec.Body.String())
+	}
+	if p, _ := profiles.Get(ctx); p.Logo == nil || p.Logo.ID != current {
+		t.Errorf("logo berubah oleh unggahan yang ditolak: %+v", p.Logo)
+	}
+}
