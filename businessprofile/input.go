@@ -29,6 +29,29 @@ type Input struct {
 	Version int `json:"version"`
 }
 
+// changed menyebut isian yang berbeda dari old, dengan nama field JSON-nya.
+// Hanya namanya: nilai seperti NPWP tidak ikut masuk jejak audit.
+func (in Input) changed(old Input) []string {
+	var out []string
+	for _, f := range []struct{ name, now, was string }{
+		{"display_name", in.DisplayName, old.DisplayName},
+		{"industry", in.Industry, old.Industry},
+		{"email", in.Email, old.Email},
+		{"phone", in.Phone, old.Phone},
+		{"business_type", in.BusinessType, old.BusinessType},
+		{"legal_name", in.LegalName, old.LegalName},
+		{"tax_id", in.TaxID, old.TaxID},
+		{"address", in.Address, old.Address},
+		{"region_code", in.RegionCode, old.RegionCode},
+		{"postcode", in.Postcode, old.Postcode},
+	} {
+		if f.now != f.was {
+			out = append(out, f.name)
+		}
+	}
+	return out
+}
+
 // Jenis usaha, sama dengan business_type di platform.
 const (
 	TypeIndividual = "individual"

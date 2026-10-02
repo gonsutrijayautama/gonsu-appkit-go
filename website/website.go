@@ -27,6 +27,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	appkit "github.com/gonsutrijayautama/gonsu-appkit-go"
+	"github.com/gonsutrijayautama/gonsu-appkit-go/audit"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/businessprofile"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/media"
 )
@@ -75,6 +77,7 @@ type Service struct {
 	pool     *pgxpool.Pool
 	profiles *businessprofile.Service
 	media    *media.Service
+	trail    *audit.Service
 	hooks    appkit.Hooks
 	opts     Options
 
@@ -87,9 +90,20 @@ type cached struct {
 	at   time.Time
 }
 
-// New mengembalikan service website. Identitas dibaca lewat profiles, dan
-// gambar disimpan lewat m.
-func New(pool *pgxpool.Pool, profiles *businessprofile.Service, m *media.Service, hooks appkit.Hooks, opts Options) (*Service, error) {
+// Nama tindakan di jejak audit, kelompok audit.CategorySettings.
+const (
+	// ActionUpdated: pengaturan disimpan. Details "fields" menyebut isian yang
+	// berubah, tanpa nilainya.
+	ActionUpdated = "website.updated"
+	// ActionImageChanged dan ActionImageRemoved: Details "slot" menyebut
+	// tempat gambarnya.
+	ActionImageChanged = "website.image_changed"
+	ActionImageRemoved = "website.image_removed"
+)
+
+// New mengembalikan service website. Identitas dibaca lewat profiles, gambar
+// disimpan lewat m, dan setiap perubahan dicatat lewat trail.
+func New(pool *pgxpool.Pool, profiles *businessprofile.Service, m *media.Service, trail *audit.Service, hooks appkit.Hooks, opts Options) (*Service, error) {
 	switch {
 	case pool == nil:
 		return nil, errors.New("website: pool wajib diisi")
@@ -97,6 +111,8 @@ func New(pool *pgxpool.Pool, profiles *businessprofile.Service, m *media.Service
 		return nil, errors.New("website: service profil bisnis wajib diisi")
 	case m == nil:
 		return nil, errors.New("website: service media wajib diisi")
+	case trail == nil:
+		return nil, errors.New("website: service jejak audit wajib diisi")
 	case opts.PublicOrganization == nil:
 		return nil, errors.New("website: Options.PublicOrganization wajib diisi")
 	}
@@ -109,7 +125,7 @@ func New(pool *pgxpool.Pool, profiles *businessprofile.Service, m *media.Service
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
-	return &Service{pool: pool, profiles: profiles, media: m, hooks: hooks, opts: opts, cache: map[uuid.UUID]cached{}}, nil
+	return &Service{pool: pool, profiles: profiles, media: m, trail: trail, hooks: hooks, opts: opts, cache: map[uuid.UUID]cached{}}, nil
 }
 
 // Settings adalah pengaturan website di API bersesi.
@@ -203,6 +219,34 @@ type stored struct {
 	Channels       Channels `json:"channels"`
 	SEOTitle       string   `json:"seo_title"`
 	SEODescription string   `json:"seo_description"`
+}
+
+// changed menyebut isian yang berbeda dari old, dengan nama field JSON di
+// API. Hanya namanya; isinya tidak ikut masuk jejak audit.
+func (d stored) changed(old stored) []string {
+	if old.Mode == "" {
+		old.Mode = ModeSignIn
+	}
+	var out []string
+	for _, f := range []struct {
+		name    string
+		differs bool
+	}{
+		{"mode", d.Mode != old.Mode},
+		{"tagline", d.Tagline != old.Tagline},
+		{"summary", d.Summary != old.Summary},
+		{"about.text", d.AboutText != old.AboutText},
+		{"services", !slices.Equal(d.Services, old.Services)},
+		{"contact", d.Contact != old.Contact},
+		{"channels", d.Channels != old.Channels},
+		{"seo.title", d.SEOTitle != old.SEOTitle},
+		{"seo.description", d.SEODescription != old.SEODescription},
+	} {
+		if f.differs {
+			out = append(out, f.name)
+		}
+	}
+	return out
 }
 
 func (d stored) document() Document {
@@ -302,14 +346,39 @@ func (s *Service) Update(ctx context.Context, in Input) (Settings, error) {
 	if errs := in.normalize(); len(errs) > 0 {
 		return Settings{}, appkit.Validation("Isian belum lengkap.", errs...)
 	}
-	raw, err := json.Marshal(in.stored())
+	doc := in.stored()
+	raw, err := json.Marshal(doc)
 	if err != nil {
 		return Settings{}, err
 	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Settings{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Isi sekarang dibaca dan dikunci, untuk mencatat isian mana yang berubah.
+	// Pengaturan yang belum pernah disimpan dibandingkan dengan bawaannya.
+	var (
+		old    stored
+		oldRaw []byte
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT settings FROM appkit_websites WHERE organization_id = $1 FOR UPDATE`, org).Scan(&oldRaw)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return Settings{}, fmt.Errorf("website: membaca pengaturan: %w", err)
+	}
+	if oldRaw != nil {
+		if err := json.Unmarshal(oldRaw, &old); err != nil {
+			return Settings{}, fmt.Errorf("website: dokumen pengaturan rusak: %w", err)
+		}
+	}
+
 	// Sama dengan profil bisnis: baris baru hanya untuk version 0; baris yang
 	// ada hanya berubah bila version-nya masih yang dibaca pengirim.
 	var version int
-	err = s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO appkit_websites (organization_id, settings, version)
 		SELECT $1, $2, 1 WHERE $3 = 0
 		ON CONFLICT (organization_id) DO UPDATE SET
@@ -317,7 +386,7 @@ func (s *Service) Update(ctx context.Context, in Input) (Settings, error) {
 		WHERE appkit_websites.version = 0
 		RETURNING version`, org, raw, in.Version).Scan(&version)
 	if errors.Is(err, pgx.ErrNoRows) && in.Version > 0 {
-		err = s.pool.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 			UPDATE appkit_websites SET settings = $2, version = version + 1, updated_at = now()
 			WHERE organization_id = $1 AND version = $3
 			RETURNING version`, org, raw, in.Version).Scan(&version)
@@ -327,6 +396,18 @@ func (s *Service) Update(ctx context.Context, in Input) (Settings, error) {
 	}
 	if err != nil {
 		return Settings{}, fmt.Errorf("website: menyimpan pengaturan: %w", err)
+	}
+	// Simpan tanpa perubahan tidak dicatat: tidak ada yang diubah.
+	if fields := doc.changed(old); len(fields) > 0 {
+		if err := s.trail.RecordTx(ctx, tx, audit.Entry{
+			Category: audit.CategorySettings, Action: ActionUpdated,
+			Summary: "Pengaturan website diubah.", Details: map[string]any{"fields": fields},
+		}); err != nil {
+			return Settings{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Settings{}, err
 	}
 	s.forget(org)
 	return s.lookup(ctx, org)
@@ -433,6 +514,19 @@ func (s *Service) swapImage(ctx context.Context, org uuid.UUID, slot Slot, image
 		UPDATE appkit_websites SET `+column+` = $2, updated_at = now()
 		WHERE organization_id = $1`, org, image); err != nil {
 		return fmt.Errorf("website: memasang gambar: %w", err)
+	}
+	// Menghapus gambar yang tidak ada tidak mengubah apa pun, jadi tidak dicatat.
+	entry := audit.Entry{
+		Category: audit.CategorySettings, Action: ActionImageChanged,
+		Summary: "Gambar website diganti.", Details: map[string]any{"slot": string(slot)},
+	}
+	if image == nil {
+		entry.Action, entry.Summary = ActionImageRemoved, "Gambar website dihapus."
+	}
+	if image != nil || old != nil {
+		if err := s.trail.RecordTx(ctx, tx, entry); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err

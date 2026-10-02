@@ -28,7 +28,8 @@ import (
 // memegangnya diputuskan produk lewat Hooks.Authorize.
 type Permission string
 
-// Hooks adalah yang diserahkan produk ke setiap modul. Ketiganya wajib.
+// Hooks adalah yang diserahkan produk ke setiap modul. Organization,
+// Authorize, dan WriteError wajib; User wajib untuk jejak audit.
 type Hooks struct {
 	// Organization mengembalikan organization request ini, dari sesi yang
 	// sudah diperiksa produk. Modul tidak pernah membaca organization dari
@@ -46,9 +47,16 @@ type Hooks struct {
 	// selain itu galat tak terduga yang rinciannya tidak boleh sampai ke
 	// pengguna.
 	WriteError func(w http.ResponseWriter, r *http.Request, err error)
+
+	// User mengembalikan id pengguna request ini di dalam produk, dari sesi
+	// yang sudah diperiksa produk. Dipakai jejak audit (package audit) untuk
+	// mencatat pelaku sebuah perubahan, jadi wajib bagi produk yang memasang
+	// modul yang mencatat: businessprofile, website, roles. Validate tidak
+	// mewajibkannya; audit.New yang memintanya.
+	User func(ctx context.Context) (uuid.UUID, error)
 }
 
-// Validate memastikan ketiga pengait terisi. Dipanggil konstruktor modul:
+// Validate memastikan ketiga pengait wajib terisi. Dipanggil konstruktor modul:
 // pengait yang kosong harus gagal saat start, bukan saat permintaan pertama.
 func (h Hooks) Validate() error {
 	switch {

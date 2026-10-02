@@ -30,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	appkit "github.com/gonsutrijayautama/gonsu-appkit-go"
+	"github.com/gonsutrijayautama/gonsu-appkit-go/audit"
 	"github.com/gonsutrijayautama/gonsu-appkit-go/media"
 )
 
@@ -40,22 +41,35 @@ const Manage appkit.Permission = "settings.business.manage"
 type Service struct {
 	pool  *pgxpool.Pool
 	media *media.Service
+	trail *audit.Service
 	hooks appkit.Hooks
 }
 
-// New mengembalikan service profil bisnis. Logo disimpan lewat m.
-func New(pool *pgxpool.Pool, m *media.Service, hooks appkit.Hooks) (*Service, error) {
+// New mengembalikan service profil bisnis. Logo disimpan lewat m, dan setiap
+// perubahan dicatat lewat trail.
+func New(pool *pgxpool.Pool, m *media.Service, trail *audit.Service, hooks appkit.Hooks) (*Service, error) {
 	switch {
 	case pool == nil:
 		return nil, errors.New("businessprofile: pool wajib diisi")
 	case m == nil:
 		return nil, errors.New("businessprofile: service media wajib diisi")
+	case trail == nil:
+		return nil, errors.New("businessprofile: service jejak audit wajib diisi")
 	}
 	if err := hooks.Validate(); err != nil {
 		return nil, err
 	}
-	return &Service{pool: pool, media: m, hooks: hooks}, nil
+	return &Service{pool: pool, media: m, trail: trail, hooks: hooks}, nil
 }
+
+// Nama tindakan di jejak audit, kelompok audit.CategorySettings.
+const (
+	// ActionUpdated: isian profil disimpan. Details "fields" menyebut isian
+	// yang berubah, tanpa nilainya.
+	ActionUpdated     = "business_profile.updated"
+	ActionLogoChanged = "business_profile.logo_changed"
+	ActionLogoRemoved = "business_profile.logo_removed"
+)
 
 // Profile adalah profil bisnis di API. Isian yang belum diisi berupa string
 // kosong, bukan null.
@@ -209,11 +223,32 @@ func (s *Service) Update(ctx context.Context, in Input) (Profile, error) {
 	if errs := in.normalize(); len(errs) > 0 {
 		return Profile{}, appkit.Validation("Isian belum lengkap.", errs...)
 	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Profile{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Isi sekarang dibaca dan dikunci, untuk mencatat isian mana yang berubah.
+	// Profil yang belum pernah disimpan dibandingkan dengan isian kosong.
+	var old Input
+	err = tx.QueryRow(ctx, `
+		SELECT display_name, industry, email, phone, business_type, legal_name, tax_id,
+		       address, region_code, postcode
+		FROM appkit_business_profiles
+		WHERE organization_id = $1 FOR UPDATE`, org).Scan(
+		&old.DisplayName, &old.Industry, &old.Email, &old.Phone, &old.BusinessType, &old.LegalName, &old.TaxID,
+		&old.Address, &old.RegionCode, &old.Postcode)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return Profile{}, fmt.Errorf("businessprofile: membaca profil: %w", err)
+	}
+
 	// Baris baru hanya untuk version 0; baris yang ada hanya berubah bila
 	// version-nya masih yang dibaca pengirim. Tidak ada baris yang kembali
 	// berarti salah satunya tidak terpenuhi.
 	var version int
-	err = s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO appkit_business_profiles (organization_id, display_name, industry, email, phone,
 			business_type, legal_name, tax_id, address, region_code, postcode, version)
 		SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 1 WHERE $12 = 0
@@ -229,7 +264,7 @@ func (s *Service) Update(ctx context.Context, in Input) (Profile, error) {
 		org, in.DisplayName, in.Industry, in.Email, in.Phone,
 		in.BusinessType, in.LegalName, in.TaxID, in.Address, in.RegionCode, in.Postcode, in.Version).Scan(&version)
 	if errors.Is(err, pgx.ErrNoRows) && in.Version > 0 {
-		err = s.pool.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 			UPDATE appkit_business_profiles SET
 				display_name = $2, industry = $3, email = $4, phone = $5,
 				business_type = $6, legal_name = $7, tax_id = $8, address = $9,
@@ -245,6 +280,18 @@ func (s *Service) Update(ctx context.Context, in Input) (Profile, error) {
 	}
 	if err != nil {
 		return Profile{}, fmt.Errorf("businessprofile: menyimpan profil: %w", err)
+	}
+	// Simpan tanpa perubahan tidak dicatat: tidak ada yang diubah.
+	if fields := in.changed(old); len(fields) > 0 {
+		if err := s.trail.RecordTx(ctx, tx, audit.Entry{
+			Category: audit.CategorySettings, Action: ActionUpdated,
+			Summary: "Profil bisnis diubah.", Details: map[string]any{"fields": fields},
+		}); err != nil {
+			return Profile{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Profile{}, err
 	}
 	return s.Lookup(ctx, org)
 }
@@ -318,6 +365,16 @@ func (s *Service) swapLogo(ctx context.Context, org uuid.UUID, logo *uuid.UUID) 
 		UPDATE appkit_business_profiles SET logo_media_id = $2, updated_at = now()
 		WHERE organization_id = $1`, org, logo); err != nil {
 		return fmt.Errorf("businessprofile: memasang logo: %w", err)
+	}
+	// Menghapus logo yang tidak ada tidak mengubah apa pun, jadi tidak dicatat.
+	entry := audit.Entry{Category: audit.CategorySettings, Action: ActionLogoChanged, Summary: "Logo bisnis diganti."}
+	if logo == nil {
+		entry.Action, entry.Summary = ActionLogoRemoved, "Logo bisnis dihapus."
+	}
+	if logo != nil || old != nil {
+		if err := s.trail.RecordTx(ctx, tx, entry); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
