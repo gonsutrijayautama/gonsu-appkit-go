@@ -38,6 +38,7 @@ lisensinya proprietary (lihat `LICENSE`).
   hanya jalur berhasil.
 - **Tanpa kode khusus satu penyedia penyimpanan.** `media/s3store` berbicara
   API S3 umum; yang membedakan R2, AWS, dan lainnya hanya `Options`.
-- **CI hanya memakai runner GitHub**, tidak pernah self-hosted.
+- **CI hanya memakai runner GitHub**, tidak pernah self-hosted, dengan versi
+  yang ditulis terang (`ubuntu-24.04`), bukan `ubuntu-latest`.
 - **Dokumen ikut kode**, di PR yang sama: `README.md` untuk cara memasang dan
   daftar endpoint.
