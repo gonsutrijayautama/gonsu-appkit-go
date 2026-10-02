@@ -548,3 +548,168 @@ func TestSaveReplacing(t *testing.T) {
 		t.Errorf("SaveReplacing tanpa berkas lama: %v", err)
 	}
 }
+
+// Kuota penyimpanan satu untuk media dan berkas di luar package ini: yang
+// sudah terpakai di sana ikut dihitung lewat OtherUsage, dan pesannya menyebut
+// pemakaian gabungan. Usage tetap hanya berkas media.
+func TestQuotaCountsOtherUsage(t *testing.T) {
+	pool := testdb.New(t)
+	ctx := context.Background()
+	shared, alone := uuid.New(), uuid.New()
+	quota := func(context.Context, uuid.UUID) (int64, error) { return 4 << 10, nil }
+
+	// Byte yang terpakai shared di luar media; organization lain tidak
+	// memakai apa pun di sana.
+	var elsewhere int64
+	s, err := media.New(pool, testdb.Hooks(), media.Options{
+		Quota: quota,
+		OtherUsage: func(_ context.Context, org uuid.UUID) (int64, error) {
+			if org != shared {
+				return 0, nil
+			}
+			return elsewhere, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	save := func(org uuid.UUID, n int) (media.File, error) {
+		return s.Save(ctx, org, bytes.NewReader(sized(n)))
+	}
+	wantUsage := func(org uuid.UUID, bytes int64, files int) {
+		t.Helper()
+		got, err := s.Usage(ctx, org)
+		if err != nil {
+			t.Fatalf("Usage: %v", err)
+		}
+		if got.Bytes != bytes || got.Files != files {
+			t.Errorf("Usage = %+v, ingin %d byte dalam %d berkas", got, bytes, files)
+		}
+	}
+
+	elsewhere = 2 << 10
+	if _, err := save(shared, 1<<10); err != nil {
+		t.Fatalf("Save di bawah kuota bersama: %v", err)
+	}
+	// 2 KB di luar + 1 KB media dari 4 KB: 1,5 KB lagi tidak muat.
+	_, err = save(shared, 1<<10+512)
+	wantQuotaExceeded(t, err, "Penyimpanan penuh: 3 KB dari 4 KB sudah terpakai.")
+	wantUsage(shared, 1<<10, 1)
+
+	// Tepat sampai batas masih boleh.
+	if _, err := save(shared, 1<<10); err != nil {
+		t.Fatalf("Save tepat sampai batas: %v", err)
+	}
+	_, err = save(shared, 64)
+	wantQuotaExceeded(t, err, "4 KB dari 4 KB")
+	wantUsage(shared, 2<<10, 2)
+
+	// Organization lain tidak ikut menanggung pemakaian itu.
+	if _, err := save(alone, 4<<10); err != nil {
+		t.Errorf("Save organization lain: %v", err)
+	}
+
+	// Tanpa OtherUsage, hanya berkas media yang dihitung, seperti semula:
+	// service lain di database yang sama masih menerima 1 KB untuk shared, dan
+	// pesannya hanya menyebut pemakaian media.
+	plain, err := media.New(pool, testdb.Hooks(), media.Options{Quota: quota})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plain.Save(ctx, shared, bytes.NewReader(sized(1<<10))); err != nil {
+		t.Errorf("Save tanpa OtherUsage: %v", err)
+	}
+	_, err = plain.Save(ctx, shared, bytes.NewReader(sized(1<<10+512)))
+	wantQuotaExceeded(t, err, "3 KB dari 4 KB")
+	// Service dengan OtherUsage melihat keduanya: 3 KB media + 2 KB di luar.
+	_, err = save(shared, 64)
+	wantQuotaExceeded(t, err, "5 KB dari 4 KB")
+
+	// Ruang yang dikosongkan di luar terpakai di sini.
+	elsewhere = 0
+	if _, err := save(shared, 1<<10); err != nil {
+		t.Errorf("Save setelah ruang di luar dikosongkan: %v", err)
+	}
+	wantUsage(shared, 4<<10, 4)
+}
+
+// Berkas pengganti tetap tidak menghitung berkas yang digantikannya, tetapi
+// pemakaian di luar media tidak ikut "digantikan".
+func TestSaveReplacingCountsOtherUsage(t *testing.T) {
+	s := newService(t, media.Options{
+		Quota:      func(context.Context, uuid.UUID) (int64, error) { return 4 << 10, nil },
+		OtherUsage: func(context.Context, uuid.UUID) (int64, error) { return 2 << 10, nil },
+	})
+	ctx := context.Background()
+	org := uuid.New()
+
+	// 2 KB di luar + 2 KB media: penuh.
+	old, err := s.Save(ctx, org, bytes.NewReader(sized(2<<10)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Save(ctx, org, bytes.NewReader(sized(1<<10)))
+	wantQuotaExceeded(t, err, "4 KB dari 4 KB")
+
+	// Pengganti yang lebih besar dari berkas lama tidak muat: yang tidak
+	// dihitung hanya 2 KB berkas lama, bukan 2 KB di luar.
+	_, err = s.SaveReplacing(ctx, org, bytes.NewReader(sized(2<<10+64)), &old.ID)
+	wantQuotaExceeded(t, err, "4 KB dari 4 KB")
+	if _, err := s.SaveReplacing(ctx, org, bytes.NewReader(sized(2<<10)), &old.ID); err != nil {
+		t.Fatalf("pengganti seukuran: %v", err)
+	}
+	// Berkas lama belum dihapus pemanggil: 4 KB media + 2 KB di luar.
+	_, err = s.SaveReplacing(ctx, org, bytes.NewReader(sized(1<<10)), &old.ID)
+	wantQuotaExceeded(t, err, "6 KB dari 4 KB")
+}
+
+// Pemakaian lain yang gagal dibaca menggagalkan unggahan, seperti kuota yang
+// gagal dibaca: lebih baik menolak daripada menyimpan melewati batas.
+func TestOtherUsageLookupFails(t *testing.T) {
+	down := errors.New("layanan lampiran mati")
+	fails := func(context.Context, uuid.UUID) (int64, error) { return 0, down }
+	s := newService(t, media.Options{
+		Quota:      func(context.Context, uuid.UUID) (int64, error) { return 1 << 20, nil },
+		OtherUsage: fails,
+	})
+	ctx := context.Background()
+	org := uuid.New()
+
+	for name, save := range map[string]func() error{
+		"Save": func() error { _, err := s.Save(ctx, org, bytes.NewReader(sized(64))); return err },
+		"SaveReplacing": func() error {
+			replaces := uuid.New()
+			_, err := s.SaveReplacing(ctx, org, bytes.NewReader(sized(64)), &replaces)
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := save()
+			if !errors.Is(err, down) {
+				t.Fatalf("galat = %v, ingin galat pembacaan pemakaian lain", err)
+			}
+			if !strings.HasPrefix(err.Error(), "media: membaca pemakaian lain: ") {
+				t.Errorf("galat = %q, ingin menyebut apa yang gagal dibaca", err)
+			}
+			if _, ok := errors.AsType[*appkit.Error](err); ok {
+				t.Error("galat pembacaan pemakaian lain tidak boleh menjadi pesan untuk pengguna")
+			}
+		})
+	}
+	if usage, _ := s.Usage(ctx, org); usage.Files != 0 {
+		t.Errorf("berkas tersimpan walau pemakaian lain tidak terbaca: %+v", usage)
+	}
+
+	// Tanpa batas, pemakaian lain tidak perlu dibaca — dan tidak dibaca.
+	for name, quota := range map[string]func(context.Context, uuid.UUID) (int64, error){
+		"tanpa Quota": nil,
+		"tanpa batas": func(context.Context, uuid.UUID) (int64, error) { return media.Unlimited, nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newService(t, media.Options{Quota: quota, OtherUsage: fails})
+			if _, err := s.Save(ctx, uuid.New(), bytes.NewReader(sized(64))); err != nil {
+				t.Errorf("Save = %v; OtherUsage tidak boleh dibaca tanpa batas", err)
+			}
+		})
+	}
+}

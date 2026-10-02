@@ -20,7 +20,8 @@
 //
 // Modul library mencatat sendiri perubahannya, di transaksi yang sama dengan
 // perubahannya (RecordTx): perubahan tanpa catatan tidak pernah tersimpan.
-// Produk mencatat miliknya lewat Record, RecordTx, atau RecordFor.
+// Produk mencatat miliknya lewat Record, RecordTx, RecordFor, atau
+// RecordForTx.
 package audit
 
 import (
@@ -199,13 +200,22 @@ func (s *Service) record(ctx context.Context, db execer, e Entry) error {
 // actor adalah pengguna yang melakukannya; uuid.Nil berarti bukan tindakan
 // seorang pengguna.
 func (s *Service) RecordFor(ctx context.Context, org, actor uuid.UUID, e Entry) error {
+	return s.recordFor(ctx, s.pool, org, actor, e)
+}
+
+// RecordForTx sama dengan RecordFor, di dalam transaksi tx milik pemanggil.
+func (s *Service) RecordForTx(ctx context.Context, tx pgx.Tx, org, actor uuid.UUID, e Entry) error {
+	return s.recordFor(ctx, tx, org, actor, e)
+}
+
+func (s *Service) recordFor(ctx context.Context, db execer, org, actor uuid.UUID, e Entry) error {
 	if org == uuid.Nil {
 		return errors.New("audit: organization kosong")
 	}
 	if actor == uuid.Nil {
-		return s.insert(ctx, s.pool, org, nil, e)
+		return s.insert(ctx, db, org, nil, e)
 	}
-	return s.insert(ctx, s.pool, org, &actor, e)
+	return s.insert(ctx, db, org, &actor, e)
 }
 
 func (s *Service) insert(ctx context.Context, db execer, org uuid.UUID, actor *uuid.UUID, e Entry) error {

@@ -1,7 +1,8 @@
 # AGENTS.md — gonsu-appkit-go
 
 Library modul standar produk GONSU: `businessprofile`, `website`, `media`
-(dengan `media/s3store`), `regions`, `roles`, dan `audit`.
+(dengan `media/s3store`), `attachments`, `regions`, `roles`, `users`, `audit`,
+`idempotency`, dan `numbering`.
 Dipasang produk lewat `go get`; project hasil `gonsu new` memakainya.
 Repository ini PUBLIK supaya `go get` berjalan tanpa kredensial, tetapi
 lisensinya proprietary (lihat `LICENSE`).
@@ -19,9 +20,10 @@ lisensinya proprietary (lihat `LICENSE`).
   galat. Galat dari pengait diteruskan apa adanya.
 - **organization hanya dari `Hooks.Organization`**, tidak pernah dari body,
   query, atau environment. Setiap query menyaring `organization_id`; data
-  milik organization lain dijawab "tidak ditemukan". Satu-satunya pengecualian
-  adalah jalur baca publik `media.Open`, dan pengecualian baru harus
-  dijelaskan di komentar fungsinya.
+  milik organization lain dijawab "tidak ditemukan". Pengecualiannya hanya
+  dua: jalur baca publik `media.Open`, dan `idempotency.DeleteExpired` yang
+  menghapus baris kedaluwarsa semua organization tanpa membaca isinya.
+  Pengecualian baru harus dijelaskan di komentar fungsinya.
 - **Perubahan dicatat di jejak audit**, lewat `audit.RecordTx` di transaksi
   yang sama dengan perubahannya: perubahan tanpa catatan tidak pernah
   tersimpan. Catatan menyebut apa yang diubah, bukan nilainya, dan tidak

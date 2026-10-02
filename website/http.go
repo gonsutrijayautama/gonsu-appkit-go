@@ -17,7 +17,7 @@ const PublicPath = "/site.json"
 //
 //	GET    /website                  pengaturan organization ini
 //	PUT    /website                  simpan seluruh isian (izin Manage)
-//	PUT    /website/images/{slot}    body: isi gambar; slot "about" atau "seo" (izin Manage)
+//	PUT    /website/images/{slot}    body: isi gambar; slot "seo" (izin Manage)
 //	DELETE /website/images/{slot}    hapus gambar (izin Manage)
 //
 // Keempatnya menjawab pengaturan yang sudah diperbarui.

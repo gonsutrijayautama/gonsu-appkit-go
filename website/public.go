@@ -25,21 +25,13 @@ type Public struct {
 	Name     string `json:"name"`
 	Industry string `json:"industry"`
 	// LogoURL relatif terhadap akar situs; kosong bila belum ada logo.
-	LogoURL  string        `json:"logo_url"`
-	Tagline  string        `json:"tagline"`
-	Summary  string        `json:"summary"`
-	About    PublicAbout   `json:"about"`
-	Services []Item        `json:"services"`
-	Contact  PublicContact `json:"contact"`
+	LogoURL string        `json:"logo_url"`
+	Tagline string        `json:"tagline"`
+	Summary string        `json:"summary"`
+	Contact PublicContact `json:"contact"`
 	// Channels berisi TAUTAN siap pakai; WhatsApp sudah berupa https://wa.me/….
 	Channels Channels  `json:"channels"`
 	SEO      PublicSEO `json:"seo"`
-}
-
-// PublicAbout adalah bagian "Tentang kami" untuk pengunjung.
-type PublicAbout struct {
-	Text     string `json:"text"`
-	ImageURL string `json:"image_url"`
 }
 
 // PublicContact adalah kontak untuk pengunjung.
@@ -107,7 +99,7 @@ func (s *Service) public(ctx context.Context, org uuid.UUID) (Public, error) {
 		return Public{}, err
 	}
 
-	site := Public{Mode: settings.Mode, Name: profile.DisplayName, Services: []Item{}}
+	site := Public{Mode: settings.Mode, Name: profile.DisplayName}
 	if profile.Logo != nil {
 		site.LogoURL = profile.Logo.URL
 	}
@@ -119,11 +111,6 @@ func (s *Service) public(ctx context.Context, org uuid.UUID) (Public, error) {
 	site.Industry = profile.Industry
 	site.Tagline = settings.Tagline
 	site.Summary = settings.Summary
-	site.About.Text = settings.About.Text
-	if settings.About.Image != nil {
-		site.About.ImageURL = settings.About.Image.URL
-	}
-	site.Services = settings.Services
 	site.Contact = PublicContact{
 		Email: profile.Email, Phone: profile.Phone,
 		Hours: settings.Contact.Hours, MapURL: settings.Contact.MapURL,

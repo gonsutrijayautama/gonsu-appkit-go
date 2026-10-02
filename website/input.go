@@ -3,32 +3,18 @@ package website
 import (
 	"fmt"
 	"net/url"
-	"slices"
 	"strings"
 	"unicode/utf8"
 
 	appkit "github.com/gonsutrijayautama/gonsu-appkit-go"
 )
 
-// Icons adalah nama ikon yang boleh dipakai sebuah layanan. Daftarnya tetap
-// dan sama di setiap produk: frontend memetakan nama ini ke gambarnya, jadi
-// nama yang tidak dikenal berarti layanan tanpa ikon. Daftar ini hanya
-// bertambah.
-var Icons = []string{
-	"package", "chart", "wrench", "headset", "truck", "shield",
-	"star", "users", "store", "clock", "wallet", "sparkles",
-}
-
 // Input adalah body PUT /website. Seluruh isian dikirim setiap kali; yang
 // tidak dikirim dianggap kosong. Gambar tidak diatur lewat sini.
 type Input struct {
-	Mode    string `json:"mode"`
-	Tagline string `json:"tagline"`
-	Summary string `json:"summary"`
-	About   struct {
-		Text string `json:"text"`
-	} `json:"about"`
-	Services []Item   `json:"services"`
+	Mode     string   `json:"mode"`
+	Tagline  string   `json:"tagline"`
+	Summary  string   `json:"summary"`
 	Contact  Contact  `json:"contact"`
 	Channels Channels `json:"channels"`
 	SEO      struct {
@@ -43,7 +29,7 @@ type Input struct {
 func (in Input) stored() stored {
 	return stored{
 		Schema: documentSchema, Mode: in.Mode, Tagline: in.Tagline, Summary: in.Summary,
-		AboutText: in.About.Text, Services: in.Services, Contact: in.Contact, Channels: in.Channels,
+		Contact: in.Contact, Channels: in.Channels,
 		SEOTitle: in.SEO.Title, SEODescription: in.SEO.Description,
 	}
 }
@@ -52,10 +38,6 @@ func (in Input) stored() stored {
 const (
 	maxTagline         = 120
 	maxSummary         = 400
-	maxAbout           = 2000
-	maxServices        = 8
-	maxServiceTitle    = 60
-	maxServiceText     = 200
 	maxHours           = 120
 	maxURL             = 300
 	maxSEOTitle        = 70
@@ -101,32 +83,11 @@ func (in *Input) normalize() []appkit.FieldError {
 		in.Mode = ModeSignIn
 	case ModeSignIn, ModeSite:
 	default:
-		fail("mode", "Pilih hanya pintu masuk atau web perusahaan.")
+		fail("mode", "Pilih hanya pintu masuk atau halaman publik.")
 	}
 
 	text("tagline", "Tagline", &in.Tagline, maxTagline)
 	text("summary", "Ringkasan", &in.Summary, maxSummary)
-	text("about.text", "Tentang kami", &in.About.Text, maxAbout)
-
-	if in.Services == nil {
-		in.Services = []Item{}
-	}
-	if len(in.Services) > maxServices {
-		fail("services", fmt.Sprintf("Layanan maksimal %d.", maxServices))
-	}
-	for i := range in.Services {
-		item := &in.Services[i]
-		field := fmt.Sprintf("services[%d]", i)
-		text(field+".title", "Nama layanan", &item.Title, maxServiceTitle)
-		if item.Title == "" {
-			fail(field+".title", "Nama layanan wajib diisi.")
-		}
-		text(field+".description", "Keterangan layanan", &item.Description, maxServiceText)
-		item.Icon = strings.TrimSpace(item.Icon)
-		if !slices.Contains(Icons, item.Icon) {
-			fail(field+".icon", "Pilih ikon dari daftar.")
-		}
-	}
 
 	text("contact.hours", "Jam kerja", &in.Contact.Hours, maxHours)
 	in.Contact.MapURL = strings.TrimSpace(in.Contact.MapURL)
