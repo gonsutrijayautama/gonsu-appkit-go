@@ -197,7 +197,7 @@ func TestGrant(t *testing.T) {
 		t.Errorf("Grant kedua = %+v, %v", again, err)
 	}
 	// Role lain: role-nya berubah, orangnya sama.
-	changed, err := f.people.Grant(bg, org, users.GrantInput{Subject: "sub-1", Role: "administrator", Actor: users.Actor{Source: users.SourceOwner}})
+	changed, err := f.people.Grant(bg, org, users.GrantInput{Subject: "sub-1", Role: "administrator", Actor: users.Actor{Source: users.SourceScreen}})
 	if err != nil || changed.ID != u.ID || changed.Role != "administrator" {
 		t.Errorf("Grant dengan role lain = %+v, %v", changed, err)
 	}
@@ -212,7 +212,7 @@ func TestGrant(t *testing.T) {
 		granted.Target != (audit.Target{Type: users.TargetType, ID: u.ID.String()}) ||
 		granted.Summary != "Akses diberikan kepada Ani Wijaya sebagai Staf." ||
 		roleChanged.Action != users.ActionRoleChanged ||
-		string(raw) != `[{"role":"staff","source":"operator"},{"role_after":"administrator","role_before":"staff","source":"owner"}]` {
+		string(raw) != `[{"role":"staff","source":"operator"},{"role_after":"administrator","role_before":"staff","source":"screen"}]` {
 		t.Errorf("catatan = %+v\n%+v\nrincian %s", granted, roleChanged, raw)
 	}
 
@@ -250,6 +250,9 @@ func TestSeats(t *testing.T) {
 	_, err := f.people.Grant(bg, org, users.GrantInput{Subject: "sub-c", Role: "staff", Actor: operator})
 	if kind(err) != appkit.KindQuotaExceeded || !strings.Contains(err.Error(), "2 dari 2") {
 		t.Errorf("Grant di atas batas = %v", err)
+	}
+	if e, _ := errors.AsType[*appkit.Error](err); e == nil || e.Limit != appkit.LimitUsers {
+		t.Errorf("batas yang penuh = %+v, ingin %q", e, appkit.LimitUsers)
 	}
 	// Orang yang sudah aktif tidak dihitung ulang.
 	if _, err := f.people.Grant(bg, org, users.GrantInput{Subject: "sub-b", Role: "administrator", Actor: operator}); err != nil {
@@ -828,5 +831,126 @@ func TestNewRequiresDependencies(t *testing.T) {
 	// Tanpa Seats dan tanpa Provision tetap sah: tanpa batas, dan tanpa undangan.
 	if _, err := users.New(f.pool, f.roles, f.trail, testdb.Hooks(), users.Options{RevokeSessions: f.options().RevokeSessions}); err != nil {
 		t.Errorf("New dengan opsi minimal ditolak: %v", err)
+	}
+}
+
+// Pemilik hanya diberi akses otomatis saat organization belum pernah memberi
+// akses kepada siapa pun — juga saat dua login pertama tiba bersamaan.
+func TestOwnerBootstrap(t *testing.T) {
+	f := setup(t)
+	bg := context.Background()
+	owner := users.Actor{Source: users.SourceOwner}
+	org := uuid.New()
+
+	u, err := f.people.Grant(bg, org, users.GrantInput{Subject: "sub-owner", Role: "administrator", Actor: owner})
+	if err != nil || u.Role != "administrator" {
+		t.Fatalf("bootstrap pemilik = %+v, %v", u, err)
+	}
+	// Sesudahnya: tidak untuk orang lain, dan tidak untuk pemilik yang sama.
+	for _, subject := range []string{"sub-lain", "sub-owner"} {
+		if _, err := f.people.Grant(bg, org, users.GrantInput{Subject: subject, Role: "administrator", Actor: owner}); !errors.Is(err, users.ErrBootstrapped) {
+			t.Errorf("bootstrap kedua untuk %s = %v", subject, err)
+		}
+	}
+	// Pemilik yang dinonaktifkan tidak mendapat aksesnya kembali dengan masuk lagi.
+	if err := f.people.Suspend(bg, org, "sub-owner", operator); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.people.Grant(bg, org, users.GrantInput{Subject: "sub-owner", Role: "administrator", Actor: owner}); !errors.Is(err, users.ErrBootstrapped) {
+		t.Errorf("bootstrap pemilik yang dinonaktifkan = %v", err)
+	}
+	if got, _ := f.people.BySubject(bg, org, "sub-owner"); got.Status != users.StatusSuspended {
+		t.Errorf("pemilik yang dinonaktifkan aktif kembali: %+v", got)
+	}
+
+	// Dua login pertama bersamaan: tepat satu yang menjadi pemilik.
+	fresh := uuid.New()
+	var wg sync.WaitGroup
+	errs := make([]error, 6)
+	for i := range errs {
+		wg.Go(func() {
+			_, errs[i] = f.people.Grant(bg, fresh, users.GrantInput{Subject: fmt.Sprintf("sub-%d", i), Role: "administrator", Actor: owner})
+		})
+	}
+	wg.Wait()
+	won := 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			won++
+		case !errors.Is(err, users.ErrBootstrapped):
+			t.Errorf("bootstrap bersamaan = %v", err)
+		}
+	}
+	if all, _ := f.people.All(bg, fresh); won != 1 || len(all) != 1 {
+		t.Errorf("pemilik dari bootstrap bersamaan = %d, tersimpan %d; ingin 1", won, len(all))
+	}
+}
+
+// GrantTx: pemberian akses tersimpan hanya bila transaksi produk tersimpan,
+// dan memegang LockGrants lebih dulu di transaksi yang sama tidak membuatnya
+// menunggu dirinya sendiri.
+func TestGrantTx(t *testing.T) {
+	f := setup(t)
+	bg := context.Background()
+	org := uuid.New()
+	in := users.GrantInput{Subject: "sub-1", Role: "customer", Actor: operator}
+
+	tx, err := f.pool.Begin(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.people.LockGrants(bg, tx, org); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.people.GrantTx(bg, tx, org, in); err != nil {
+		t.Fatalf("GrantTx: %v", err)
+	}
+	if err := tx.Rollback(bg); err != nil {
+		t.Fatal(err)
+	}
+	if all, _ := f.people.All(bg, org); len(all) != 0 {
+		t.Errorf("pemberian di transaksi yang dibatalkan tersimpan: %+v", all)
+	}
+	if got := testdb.Actions(t, f.trail, org); len(got) != 0 {
+		t.Errorf("catatan transaksi yang dibatalkan tersimpan: %v", got)
+	}
+
+	tx, err = f.pool.Begin(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := f.people.GrantTx(bg, tx, org, in)
+	if err != nil {
+		t.Fatalf("GrantTx: %v", err)
+	}
+	if err := tx.Commit(bg); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.people.ByID(bg, org, u.ID); err != nil || got.Role != "customer" {
+		t.Errorf("pengguna sesudah commit = %+v, %v", got, err)
+	}
+	if _, err := f.people.GrantTx(bg, nil, org, in); err == nil {
+		t.Error("GrantTx tanpa transaksi lolos")
+	}
+}
+
+func TestActorName(t *testing.T) {
+	f := setup(t)
+	org := uuid.New()
+	bg := context.Background()
+	named := f.grant(t, org, "sub-1", "staff")
+	unnamed, err := f.people.Grant(bg, org, users.GrantInput{Subject: "sub-2", Email: "dua@contoh.example", Role: "staff", Actor: operator})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[uuid.UUID]string{named.ID: "Nama sub-1", unnamed.ID: "dua@contoh.example", uuid.New(): ""} {
+		if got := f.people.ActorName(bg, org, id); got != want {
+			t.Errorf("ActorName(%s) = %q, ingin %q", id, got, want)
+		}
+	}
+	// Pengguna organization lain tidak dikenali.
+	if got := f.people.ActorName(bg, uuid.New(), named.ID); got != "" {
+		t.Errorf("ActorName lintas organization = %q", got)
 	}
 }

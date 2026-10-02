@@ -15,7 +15,7 @@ const (
 	KindConflict Kind = "conflict"
 	// KindQuotaExceeded: batas pemakaian organization itu sudah penuh,
 	// misalnya kuota penyimpanan paketnya. Produk memetakannya ke tawaran naik
-	// paket, bukan ke galat isian.
+	// paket, bukan ke galat isian; Error.Limit menyebut batas yang mana.
 	KindQuotaExceeded Kind = "quota_exceeded"
 	// KindIdempotencyConflict: Idempotency-Key ini sudah dipakai untuk
 	// permintaan dengan isi berbeda, atau permintaan pertama dengan key ini
@@ -23,6 +23,20 @@ const (
 	// diubah: permintaan yang sama diulang dengan key dan body yang sama,
 	// permintaan baru memakai key baru.
 	KindIdempotencyConflict Kind = "idempotency_conflict"
+)
+
+// Limit menyebut batas yang penuh pada galat KindQuotaExceeded, supaya produk
+// menawarkan paket yang tepat. Nilainya nama batas di library, bukan key hak
+// pakai platform: produk memetakannya ke katalognya sendiri.
+type Limit string
+
+const (
+	// LimitStorage: total penyimpanan berkas (media dan attachments).
+	LimitStorage Limit = "storage"
+	// LimitUsers: jumlah pengguna aktif (users).
+	LimitUsers Limit = "users"
+	// LimitCustomRoles: paket tidak menyertakan role buatan (roles).
+	LimitCustomRoles Limit = "custom_roles"
 )
 
 // FieldError menunjuk satu field yang tidak sah. Field memakai nama yang sama
@@ -37,6 +51,8 @@ type Error struct {
 	Kind    Kind
 	Message string
 	Fields  []FieldError
+	// Limit hanya terisi pada KindQuotaExceeded.
+	Limit Limit
 }
 
 func (e *Error) Error() string { return string(e.Kind) + ": " + e.Message }
@@ -56,9 +72,9 @@ func Conflict(message string) *Error {
 	return &Error{Kind: KindConflict, Message: message}
 }
 
-// QuotaExceeded mengembalikan galat "batas pemakaian penuh".
-func QuotaExceeded(message string) *Error {
-	return &Error{Kind: KindQuotaExceeded, Message: message}
+// QuotaExceeded mengembalikan galat "batas pemakaian penuh" untuk batas limit.
+func QuotaExceeded(limit Limit, message string) *Error {
+	return &Error{Kind: KindQuotaExceeded, Message: message, Limit: limit}
 }
 
 // IdempotencyConflict mengembalikan galat "Idempotency-Key sudah dipakai

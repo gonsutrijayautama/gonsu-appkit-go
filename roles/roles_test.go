@@ -581,7 +581,8 @@ func TestCustomRolesNeedTheEntitlement(t *testing.T) {
 
 	f.disable(org, true)
 
-	if _, err := f.roles.Create(ctx, roles.Input{Name: "Gudang", Permissions: in.Permissions}); kind(err) != appkit.KindQuotaExceeded {
+	_, err := f.roles.Create(ctx, roles.Input{Name: "Gudang", Permissions: in.Permissions})
+	if e, _ := errors.AsType[*appkit.Error](err); e == nil || e.Kind != appkit.KindQuotaExceeded || e.Limit != appkit.LimitCustomRoles {
 		t.Errorf("Create tanpa hak pakai = %v", err)
 	}
 	// Hak pakai diperiksa sebelum isian: yang tidak berhak tidak diberi tahu

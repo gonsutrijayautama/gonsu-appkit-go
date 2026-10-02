@@ -95,6 +95,7 @@ const (
 	maxTargetType = 60
 	maxTargetID   = 200
 	maxSummary    = 300
+	maxActorName  = 200
 	// maxDetails membatasi Details sesudah dijadikan JSON: catatan adalah
 	// ringkasan perubahan, bukan salinan datanya.
 	maxDetails = 16 << 10
@@ -135,6 +136,15 @@ type Options struct {
 	// mengetahuinya: di belakang proxy, alamat koneksi bukan alamat
 	// penggunanya. Kosong, atau alamat yang tidak sah: catatan tanpa alamat.
 	ClientAddr func(ctx context.Context) netip.Addr
+	// ActorName mengembalikan nama tampil pengguna actor di org, untuk
+	// dicatat bersama id-nya — biasanya users.Service.ActorName, dirangkai
+	// dengan penutup karena users sendiri mencatat lewat service ini. Nama
+	// yang dicatat adalah nama SAAT ITU. Kosong, atau jawaban kosong: catatan
+	// tanpa nama.
+	//
+	// Dipanggil selagi transaksi pemanggil terbuka, jadi jawablah cepat, dan
+	// jangan menggagalkan: nama yang tidak terbaca dijawab string kosong.
+	ActorName func(ctx context.Context, org, actor uuid.UUID) string
 }
 
 // Service mencatat dan membaca jejak audit.
@@ -232,15 +242,22 @@ func (s *Service) insert(ctx context.Context, db execer, org uuid.UUID, actor *u
 			addr = &text
 		}
 	}
+	var name string
+	if actor != nil && s.opts.ActorName != nil {
+		name = strings.TrimSpace(s.opts.ActorName(ctx, org, *actor))
+		if utf8.RuneCountInString(name) > maxActorName {
+			name = string([]rune(name)[:maxActorName])
+		}
+	}
 	id, err := uuid.NewV7()
 	if err != nil {
 		return err
 	}
 	if _, err := db.Exec(ctx, `
-		INSERT INTO appkit_audit_events (id, organization_id, category, action, actor_id,
+		INSERT INTO appkit_audit_events (id, organization_id, category, action, actor_id, actor_name,
 			target_type, target_id, summary, details, client_addr)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::inet)`,
-		id, org, string(e.Category), e.Action, actor,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::inet)`,
+		id, org, string(e.Category), e.Action, actor, name,
 		e.Target.Type, e.Target.ID, e.Summary, details, addr); err != nil {
 		return fmt.Errorf("audit: mencatat %s: %w", e.Action, err)
 	}
@@ -254,10 +271,13 @@ type Event struct {
 	Action   string    `json:"action"`
 	// ActorID adalah id pengguna di dalam produk (Hooks.User); null bila bukan
 	// tindakan seorang pengguna. Nama pelakunya dicari produk dari id ini.
-	ActorID *uuid.UUID     `json:"actor_id"`
-	Target  Target         `json:"target"`
-	Summary string         `json:"summary"`
-	Details map[string]any `json:"details"`
+	ActorID *uuid.UUID `json:"actor_id"`
+	// ActorName adalah nama pelaku saat tindakan dilakukan (Options.ActorName);
+	// kosong bila tidak diketahui.
+	ActorName string         `json:"actor_name"`
+	Target    Target         `json:"target"`
+	Summary   string         `json:"summary"`
+	Details   map[string]any `json:"details"`
 	// ClientAddr null bila alamat asalnya tidak diketahui.
 	ClientAddr *string   `json:"client_addr"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -312,7 +332,7 @@ func (s *Service) List(ctx context.Context, q Query) (Page, error) {
 	// berikutnya. Penanda halaman dicari di organization yang sama: penanda
 	// milik organization lain menghasilkan halaman kosong.
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, category, action, actor_id, target_type, target_id, summary, details,
+		SELECT id, category, action, actor_id, actor_name, target_type, target_id, summary, details,
 		       host(client_addr), created_at
 		FROM appkit_audit_events
 		WHERE organization_id = $1
@@ -333,7 +353,7 @@ func (s *Service) List(ctx context.Context, q Query) (Page, error) {
 			category string
 			details  []byte
 		)
-		if err := rows.Scan(&e.ID, &category, &e.Action, &e.ActorID, &e.Target.Type, &e.Target.ID,
+		if err := rows.Scan(&e.ID, &category, &e.Action, &e.ActorID, &e.ActorName, &e.Target.Type, &e.Target.ID,
 			&e.Summary, &details, &e.ClientAddr, &e.CreatedAt); err != nil {
 			return Page{}, fmt.Errorf("audit: membaca catatan: %w", err)
 		}

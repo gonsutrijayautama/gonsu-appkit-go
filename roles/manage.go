@@ -116,7 +116,7 @@ func names(perms []appkit.Permission) []string {
 var (
 	errChanged   = appkit.Conflict("Role ini sudah diubah orang lain. Muat ulang halaman, lalu ulangi perubahan Anda.")
 	errNameTaken = appkit.Validation("Isian belum sesuai.", appkit.FieldError{Field: "name", Message: "Nama ini sudah dipakai role lain."})
-	errDisabled  = appkit.QuotaExceeded("Paket Anda tidak menyertakan role buatan. Role yang sudah ada tetap berlaku, tetapi tidak dapat diubah atau ditambah.")
+	errDisabled  = appkit.QuotaExceeded(appkit.LimitCustomRoles, "Paket Anda tidak menyertakan role buatan. Role yang sudah ada tetap berlaku, tetapi tidak dapat diubah atau ditambah.")
 	errAudience  = appkit.Validation("Isian belum sesuai.", appkit.FieldError{Field: "audience", Message: "Audiens role tidak dapat diubah setelah role dibuat."})
 )
 

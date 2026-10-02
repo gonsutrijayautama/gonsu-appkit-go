@@ -168,7 +168,7 @@ func Hooks() appkit.Hooks {
 		WriteError: func(w http.ResponseWriter, _ *http.Request, err error) {
 			status, body := http.StatusInternalServerError, map[string]any{"message": "galat tak terduga"}
 			if e, ok := errors.AsType[*appkit.Error](err); ok {
-				body = map[string]any{"kind": e.Kind, "message": e.Message, "fields": e.Fields}
+				body = map[string]any{"kind": e.Kind, "message": e.Message, "fields": e.Fields, "limit": e.Limit}
 				switch e.Kind {
 				case appkit.KindValidation:
 					status = http.StatusBadRequest
