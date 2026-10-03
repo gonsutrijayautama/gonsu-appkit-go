@@ -37,6 +37,9 @@ const (
 	LimitUsers Limit = "users"
 	// LimitCustomRoles: paket tidak menyertakan role buatan (roles).
 	LimitCustomRoles Limit = "custom_roles"
+	// LimitPages: jumlah halaman penyusun halaman, atau paket yang tidak
+	// menyertakannya (pages).
+	LimitPages Limit = "pages"
 )
 
 // FieldError menunjuk satu field yang tidak sah. Field memakai nama yang sama

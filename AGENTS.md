@@ -2,7 +2,7 @@
 
 Library modul standar produk GONSU: `businessprofile`, `website`, `media`
 (dengan `media/s3store`), `attachments`, `regions`, `roles`, `users`, `audit`,
-`idempotency`, dan `numbering`.
+`idempotency`, `numbering`, dan `pages`.
 Dipasang produk lewat `go get`; project hasil `gonsu new` memakainya.
 Repository ini PUBLIK supaya `go get` berjalan tanpa kredensial, tetapi
 lisensinya proprietary (lihat `LICENSE`).

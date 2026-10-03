@@ -9,6 +9,7 @@ disalin per produk:
 |---|---|
 | `businessprofile` | profil bisnis organization: nama, kontak, identitas legal, alamat, logo |
 | `website` | identitas halaman depan publik: mode, tagline, kontak, kanal, pratinjau tautan — dan penyisipannya ke HTML |
+| `pages` | halaman publik yang disusun penyusun halaman: draf, terbit, riwayat, gambar, dan penyajiannya |
 | `media` | berkas PUBLIK (logo, gambar): di database atau object storage S3/R2, dengan kuota per organization |
 | `regions` | wilayah Indonesia sampai desa beserta kode pos, untuk pemilih alamat |
 | `roles` | role per organization: role bawaan di kode, role buatan dari layar, dan izin yang berlaku bagi pemegangnya |
@@ -148,6 +149,7 @@ atasnya.
 | `users.New(pool, access, trail, hooks, opts)` | `Hooks.User`, `Options.RevokeSessions` | `Seats`, `Provision`, `Available` |
 | `idempotency.New(pool, opts)` | — | `TTL` |
 | `numbering.New(pool, trail, hooks, opts)` | `Options.Types` | `Timezone`, `DefaultTimezone` |
+| `pages.New(pool, sites, files, trail, hooks, opts)` | `Hooks.User`, `Options.Blocks`, `Options.Limit` | `Root`, `Reserved`, `ImportLegacy`, `MaxDocumentBytes`, `MaxRevisions`, `Logger` |
 | `regions.Routes(hooks)` | tiga pengait wajib | — |
 
 `roles` dan `users` saling membutuhkan, begitu pula `media` dan `attachments`
@@ -184,6 +186,15 @@ Relatif terhadap akar API produk (`/v1`), di balik sesi:
 | `POST` | `/users` | `settings.users.manage` | beri akses lewat email; menjawab `201` |
 | `PATCH` | `/users/{id}` | `settings.users.manage` | ubah role atau status |
 | `GET` | `/audit-events?category=&before=&limit=` | `settings.audit.view` | jejak audit, terbaru dulu |
+| `GET` | `/pages` | `settings.pages.manage` | halaman, batas paket, tawaran impor website lama |
+| `POST` | `/pages` | `settings.pages.manage` | buat halaman kosong; menjawab `201` |
+| `GET` / `PUT` / `DELETE` | `/pages/{id}` | `settings.pages.manage` | satu halaman beserta drafnya; simpan pengaturan dan draf; hapus |
+| `POST` | `/pages/{id}/publish`, `/pages/{id}/unpublish` | `settings.pages.manage` | simpan lalu terbitkan; tarik dari pengunjung |
+| `GET` | `/pages/{id}/revisions` | `settings.pages.manage` | riwayat terbitan |
+| `POST` | `/pages/{id}/revisions/{revision}/restore` | `settings.pages.manage` | terbitan itu menjadi draf |
+| `POST` | `/pages/{id}/images` | `settings.pages.manage` | body: gambar blok; menjawab `201` dan berkasnya |
+| `PUT` / `DELETE` | `/pages/{id}/images/seo` | `settings.pages.manage` | gambar pratinjau halaman |
+| `POST` | `/pages/import-legacy` | `settings.pages.manage` | isi website lama ke draf beranda |
 | `GET` | `/document-numbering` | `settings.numbering.manage` | skema penomoran tiap jenis dokumen, dan daftar token |
 | `PUT` | `/document-numbering/{type}` | `settings.numbering.manage` | simpan pola dan kebijakan reset satu jenis dokumen |
 
@@ -193,6 +204,7 @@ Tanpa sesi, di akar situs:
 |---|---|---|
 | `GET` | `/media/{id}` | isi berkas; boleh disimpan peramban selamanya |
 | `GET` | `/site.json` | tampilan publik halaman depan |
+| `GET` | `/page.json?path=` | halaman terbit di alamat itu; 404 bila tidak ada |
 
 **Simpan-bersamaan.** `PUT /business-profile`, `PUT /website`,
 `PUT /roles/{key}`, dan `PUT /document-numbering/{type}` membawa `version`
@@ -699,6 +711,133 @@ err = trail.RecordFor(ctx, org, userID, audit.Entry{
   `INSERT` langsung ke `appkit_audit_events` sekali, dengan `created_at`
   aslinya. Database menolak `UPDATE`, jadi isilah dengan benar sejak awal.
 
+## Halaman
+
+Halaman publik sebuah organization — beranda, layanan, tentang — yang disusun
+dengan penyusun halaman di frontend produk. Modul ini menyimpan dan menyajikan
+halaman; editornya (Puck) dan blok-bloknya ada di produk.
+
+```go
+sitePages, err := pages.New(pool, sites, files, trail, hooks, pages.Options{
+	// Jenis blok dan isiannya: sama dengan konfigurasi penyusun halaman.
+	Blocks: []pages.Block{
+		{Type: "Hero", Fields: map[string]pages.Field{
+			"title": {Kind: pages.FieldText},
+			"image": {Kind: pages.FieldImage},
+			"button": {Kind: pages.FieldObject, Fields: map[string]pages.Field{
+				"label": {Kind: pages.FieldText}, "href": {Kind: pages.FieldLink},
+			}},
+		}},
+		{Type: "Text", Fields: map[string]pages.Field{"body": {Kind: pages.FieldRichText}}},
+		{Type: "Columns", Fields: map[string]pages.Field{"left": {Kind: pages.FieldSlot}, "right": {Kind: pages.FieldSlot}}},
+	},
+	// Jumlah halaman dari hak pakai paket.
+	Limit: func(ctx context.Context, org uuid.UUID) (int64, error) {
+		n, unlimited := license.Limit(ctx, entitlement.PagesMax)
+		if unlimited {
+			return pages.Unlimited, nil
+		}
+		return n, nil
+	},
+	// Alamat milik produk, termasuk route kerangka halaman.
+	Reserved: []string{"/login", "/settings", "/v1", "/_halaman"},
+	// Isi website lama ke blok produk.
+	ImportLegacy: importLegacy,
+})
+
+// Penyaji frontend produk: setiap alamat yang bukan route aplikasi.
+if page, ok := sitePages.RenderPage(r, halamanShell); ok {
+	serve(w, page)
+} else if r.URL.Path == "/" {
+	serve(w, sites.RenderHome(r, indexHTML))
+} else {
+	notFound(w, r)
+}
+```
+
+**Isi halaman diperiksa server.** Setiap draf yang disimpan dibandingkan
+dengan katalog blok:
+
+- blok dan isian yang tidak terdaftar ditolak;
+- `FieldRichText` dibersihkan: hanya `p`, `h2`–`h4`, `strong`, `em`, `u`, `s`,
+  `a`, `ul`, `ol`, `li`, `blockquote`, `hr`, dan `br`;
+- tautan (`FieldLink`, dan `href` di teks berformat) hanya `https`, alamat
+  situs ini (`/…`), atau jangkar (`#…`);
+- gambar (`FieldImage`) hanya berkas media organization itu sendiri, diunggah
+  lewat `POST /pages/{id}/images`; data URL dan alamat luar ditolak;
+- paling besar 256 KB, 300 blok, dan lima tingkat blok bersarang.
+
+Draf yang kelak disusun AI melewati pemeriksaan yang sama. Katalog di Go
+harus sama dengan konfigurasi penyusun halaman di frontend; test di produk
+yang membandingkan keduanya mencegahnya menyimpang.
+
+**Draf dan terbit.**
+- Yang disusun selalu draf. `POST /pages/{id}/publish` menyimpan dan
+  menerbitkan dalam satu transaksi, jadi yang terbit tepat yang terakhir
+  dilihat penyusunnya. Halaman tanpa blok tidak dapat diterbitkan.
+- Pengaturan halaman — judul, alamat, menu, SEO — langsung berlaku; isinya
+  baru terlihat pengunjung sesudah diterbitkan.
+- Status halaman: `draft`, `published`, atau `changed` (terbit, tetapi
+  drafnya belum diterbitkan).
+- Setiap terbitan disimpan di riwayat, 20 terakhir per halaman
+  (`Options.MaxRevisions`), dengan nomor, penerbit, dan namanya saat itu.
+  `restore` menjadikan sebuah terbitan draf; yang tampil tidak berubah sampai
+  diterbitkan.
+
+**Alamat.** `/` untuk beranda, yang alamatnya tidak dapat diganti; halaman
+lain satu tingkat (`/layanan`), huruf kecil, angka, dan tanda hubung, paling
+panjang 60 karakter. Alamat di `Options.Reserved` dan `/media` tidak dapat
+dipakai.
+
+**Jumlah halaman mengikuti paket** (`Options.Limit`, galat `KindQuotaExceeded`
+dengan `appkit.LimitPages`). `pages.Unlimited` berarti tanpa batas; **nol
+berarti paketnya tidak menyertakan penyusun halaman**: halaman yang terbit
+tetap tampil, tetapi tidak dapat ditambah, diubah, diterbitkan, atau
+dikembalikan. Menarik dan menghapus tetap boleh. Organization yang turun ke
+paket dengan batas lebih kecil dari jumlah halamannya tetap dapat menyusun
+halaman yang ada; yang ditolak hanya menambah.
+
+**Gambar** ikut kuota penyimpanan. Gambar yang tidak lagi dirujuk draf,
+terbitan, maupun riwayat halaman mana pun dihapus sendiri, mulai sehari
+sesudah diunggah.
+
+**Penyajian.**
+- Frontend produk berupa build statis, jadi halaman di alamat bebas disajikan
+  server: `RenderPage(r, shell)` menyisipkan judul, SEO, tag pratinjau tautan,
+  identitas website (`<script id="gonsu-site">`), dan halaman terbit
+  (`<script id="gonsu-page">`) ke kerangka halaman hasil build.
+- Jawaban `ok` false berarti tidak ada halaman untuk ditampilkan: draf,
+  alamat tanpa halaman, mode `signin`, dan halaman milik organization lain.
+  Produk menyajikan 404-nya, atau untuk `/` halaman depan biasa lewat
+  `RenderHome`. `RenderPage` tidak pernah menjadi galat 500.
+- Mode website tetap berlaku: di mode `signin` tidak ada halaman yang tampil,
+  walau sudah terbit.
+- `GET /page.json?path=…` memberi isi yang sama untuk perpindahan halaman di
+  frontend tanpa memuat ulang.
+
+**Jejak audit**: `page.created`, `page.settings_updated` (`fields`),
+`page.published` (`number`), `page.unpublished`, `page.deleted`,
+`page.legacy_imported`. Menyimpan draf tidak dicatat: draf tidak terlihat
+pengunjung, dan terbitannya yang dicatat.
+
+**Impor website lama.** `GET /pages` memuat `legacy.available` bila isi
+website versi lama ada dan belum diimpor. `POST /pages/import-legacy`
+menyusun draf beranda dari isinya lewat `Options.ImportLegacy` milik produk —
+hanya produk yang tahu nama bloknya — dan membuat beranda bila belum ada. Isi
+lamanya di website tetap utuh.
+
+`<script id="gonsu-page">` dan `GET /page.json`:
+
+```json
+{
+  "path": "/layanan",
+  "title": "Layanan",
+  "seo": { "title": "Layanan — Usaha Contoh", "description": "…", "image_url": "/media/…" },
+  "data": { "root": { "props": {} }, "content": [ { "type": "Hero", "props": { "id": "Hero-1", "title": "…" } } ] },
+  "navigation": [ { "path": "/", "title": "Beranda" }, { "path": "/layanan", "title": "Layanan" } ]
+}
+```
+
 ## Idempotency
 
 Mutasi yang diulang klien — karena timeout, koneksi putus, atau tombol ditekan
@@ -971,6 +1110,17 @@ Aturan kontribusi ada di `AGENTS.md`.
 
 ## Perubahan
 
+- **v0.5.0** (belum dirilis)
+  - Baru: modul `pages` — halaman publik dari penyusun halaman: katalog blok
+    dari produk, pembersihan teks berformat, draf dan terbit, riwayat, gambar,
+    `RenderPage`, dan impor isi website lama.
+  - Baru: `appkit.LimitPages`, `website.Service.PublicOrganization`,
+    `website.RequestOrigin`, dan `audit.Service.ActorName`.
+  - Dependensi baru: `github.com/microcosm-cc/bluemonday` (BSD-3), untuk
+    membersihkan teks berformat.
+  - Migrasi baru: `00013` (`appkit_pages`, `appkit_page_revisions`,
+    `appkit_page_media`, `appkit_page_imports`).
+  - Tidak ada yang memutus.
 - **v0.4.0**
   - Baru: modul `audit` — jejak audit per organization, hanya dapat ditambah.
   - Baru: modul `roles` — role bawaan di kode, role buatan per organization,
