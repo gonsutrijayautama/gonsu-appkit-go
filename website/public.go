@@ -259,6 +259,17 @@ func (s *Service) RenderHome(r *http.Request, page []byte) []byte {
 	return InjectHTML(page, site, requestOrigin(r))
 }
 
+// PublicOrganization menjawab organization permintaan tanpa sesi r, menurut
+// Options.PublicOrganization. Dipakai modul lain yang menyajikan halaman
+// publik organization yang sama (package pages).
+func (s *Service) PublicOrganization(r *http.Request) (uuid.UUID, error) {
+	return s.opts.PublicOrganization(r)
+}
+
+// RequestOrigin adalah alamat aplikasi menurut permintaan r, seperti yang
+// dipakai InjectHTML untuk gambar pratinjau.
+func RequestOrigin(r *http.Request) string { return requestOrigin(r) }
+
 // requestOrigin menurunkan alamat aplikasi dari permintaan. Di belakang
 // reverse proxy, skemanya dibaca dari X-Forwarded-Proto.
 //

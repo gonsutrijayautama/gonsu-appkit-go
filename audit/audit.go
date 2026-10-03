@@ -228,6 +228,21 @@ func (s *Service) recordFor(ctx context.Context, db execer, org, actor uuid.UUID
 	return s.insert(ctx, db, org, &actor, e)
 }
 
+// ActorName mengembalikan nama tampil pengguna actor di org menurut
+// Options.ActorName — kosong bila tidak diisi atau tidak diketahui. Untuk
+// modul lain yang mencatat nama pelaku di tabelnya sendiri, mis. penerbit
+// sebuah halaman (package pages).
+func (s *Service) ActorName(ctx context.Context, org, actor uuid.UUID) string {
+	if s.opts.ActorName == nil || actor == uuid.Nil {
+		return ""
+	}
+	name := strings.TrimSpace(s.opts.ActorName(ctx, org, actor))
+	if utf8.RuneCountInString(name) > maxActorName {
+		name = string([]rune(name)[:maxActorName])
+	}
+	return name
+}
+
 func (s *Service) insert(ctx context.Context, db execer, org uuid.UUID, actor *uuid.UUID, e Entry) error {
 	details, err := e.prepare()
 	if err != nil {
@@ -243,11 +258,8 @@ func (s *Service) insert(ctx context.Context, db execer, org uuid.UUID, actor *u
 		}
 	}
 	var name string
-	if actor != nil && s.opts.ActorName != nil {
-		name = strings.TrimSpace(s.opts.ActorName(ctx, org, *actor))
-		if utf8.RuneCountInString(name) > maxActorName {
-			name = string([]rune(name)[:maxActorName])
-		}
+	if actor != nil {
+		name = s.ActorName(ctx, org, *actor)
 	}
 	id, err := uuid.NewV7()
 	if err != nil {
