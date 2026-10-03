@@ -131,6 +131,30 @@ for _, rt := range slices.Concat(files.PublicRoutes(), sites.PublicRoutes()) {
 }
 ```
 
+### Urutan dan yang wajib diisi
+
+Konstruktor yang kurang isinya gagal saat start, dengan pesan yang menyebut
+apa yang kurang. Susun dari atas ke bawah: setiap baris memakai service di
+atasnya.
+
+| konstruktor | wajib | opsional |
+|---|---|---|
+| `media.New(pool, hooks, opts)` | tiga pengait wajib | `Store`, `MaxBytes`, `Quota`, `OtherUsage` |
+| `attachments.New(pool, opts)` | — | `Store`, `MaxBytes`, `Types`, `Quota`, `OtherUsage` |
+| `audit.New(pool, hooks, opts)` | tiga pengait wajib, dan `Hooks.User` | `ClientAddr`, `ActorName` |
+| `businessprofile.New(pool, files, trail, hooks)` | semua argumen | — |
+| `website.New(pool, profiles, files, trail, hooks, opts)` | `Options.PublicOrganization` | `CacheTTL`, `Logger` |
+| `roles.New(pool, trail, hooks, opts)` | `Permissions`, `Builtins`, `CustomEnabled`, `UserCounts` | `LockAssignments`, `MaxCustom` |
+| `users.New(pool, access, trail, hooks, opts)` | `Hooks.User`, `Options.RevokeSessions` | `Seats`, `Provision`, `Available` |
+| `idempotency.New(pool, opts)` | — | `TTL` |
+| `numbering.New(pool, trail, hooks, opts)` | `Options.Types` | `Timezone`, `DefaultTimezone` |
+| `regions.Routes(hooks)` | tiga pengait wajib | — |
+
+`roles` dan `users` saling membutuhkan, begitu pula `media` dan `attachments`
+bila kuotanya dihitung berdua, serta `audit` dan `users` untuk nama pelaku.
+Rangkai dengan penutup yang merujuk variabel yang baru terisi sesudahnya;
+contohnya ada di bagian masing-masing.
+
 Halaman depan (`/`) hasil build frontend dilewatkan `sites.RenderHome(r, page)`
 sebelum disajikan; lihat bagian Website.
 
